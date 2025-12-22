@@ -71,8 +71,8 @@ except ImportError:
     print("✅ pycryptodome RIPEMD160 installed")
 
 # ==================== KONFIGURASI ====================
-MIN_RANGE = "100000"  # Start range (Hex) - diperkecil untuk testing
-MAX_RANGE = "1FFFFF"  # End range (Hex)
+MIN_RANGE = "80000"  # Start range (Hex) - diperkecil untuk testing
+MAX_RANGE = "fffff"  # End range (Hex)
 
 TARGET_ADDR = "1HsMJxNiV7TLxmoF6uJNkydxPFDog4NQum"  # Alamat target
 
