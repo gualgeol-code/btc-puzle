@@ -23,7 +23,6 @@ import math
 import signal
 import time
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
 
 # ==================== CONFIGURATION ====================
 # Edit these variables for your search
@@ -374,13 +373,20 @@ def main():
         return
     
     # Determine GPU configuration
+    use_multi_gpu = USE_MULTI_GPU
+    num_gpus = 1
+    
     if USE_MULTI_GPU:
         num_gpus = get_gpu_count()
         if num_gpus > 1:
             print(f"[+] Using {num_gpus} GPUs")
+            use_multi_gpu = True
         else:
             print("[+] Using single GPU mode")
-            USE_MULTI_GPU = False
+            use_multi_gpu = False
+    else:
+        print("[+] Using single GPU mode")
+        use_multi_gpu = False
     
     # Setup signal handler for graceful exit
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -394,7 +400,7 @@ def main():
     try:
         if SEARCH_MODE.lower() == "random":
             # Random search mode
-            if USE_MULTI_GPU and num_gpus > 1:
+            if use_multi_gpu and num_gpus > 1:
                 print("[+] Random search with multiple GPUs not yet implemented")
                 print("[+] Falling back to single GPU random search")
             
@@ -402,7 +408,7 @@ def main():
         
         elif SEARCH_MODE.lower() == "sequential":
             # Sequential search mode
-            if USE_MULTI_GPU and num_gpus > 1:
+            if use_multi_gpu and num_gpus > 1:
                 # Split range among GPUs
                 gpu_ranges = split_range_among_gpus(START_RANGE, END_RANGE, num_gpus)
                 
@@ -419,11 +425,12 @@ def main():
                     )
                     p.start()
                     processes.append(p)
+                    time.sleep(0.5)  # Stagger process starts
                 
                 # Wait for results
                 while any(p.is_alive() for p in processes) and not found:
                     try:
-                        msg = result_queue.get(timeout=1)
+                        msg = result_queue.get(timeout=2)
                         if 'result' in msg:
                             result = msg['result']
                             found = True
@@ -434,7 +441,10 @@ def main():
                                 if p.is_alive():
                                     p.terminate()
                             break
+                        elif 'error' in msg:
+                            print(f"GPU {msg['gpu_id']} error: {msg['error']}")
                     except:
+                        # Timeout, check if processes are still alive
                         continue
                 
                 # Cleanup
