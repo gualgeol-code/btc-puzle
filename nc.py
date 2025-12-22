@@ -37,7 +37,7 @@ KEYSPACE_MIN = 0x80000
 KEYSPACE_MAX = 0xfffff
 
 # Mode pencarian (True untuk random 100%)
-RANDOM_MODE = True
+RANDOM_MODE = False
 
 # Output file
 OUTPUT_FILE = "found_keys.txt"
