@@ -32,7 +32,7 @@ START_RANGE_HEX = "80000"
 END_RANGE_HEX = "fffff"
 
 # Search mode: "random" or "sequential"
-SEARCH_MODE = "sequential"
+SEARCH_MODE = "random"
 
 # GPU Configuration
 USE_MULTI_GPU = True  # Set to False for single GPU
