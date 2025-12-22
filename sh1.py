@@ -776,4 +776,372 @@ DEVICE_FUNC void scalar_multiply_with_lookup(jacobian_point *result, const uint2
         unsigned char nibble = nibbles[i];
         if (nibble != 0) {
             if (is_zero(&result->z)) {
-                copy
+                copy_u256(&result->x, &G_TABLE_X[nibble]);
+                copy_u256(&result->y, &G_TABLE_Y[nibble]);
+                set_one(&result->z);
+            } else {
+                point_add_mixed(result, result, &G_TABLE_X[nibble], &G_TABLE_Y[nibble]);
+            }
+        }
+    }
+}
+
+// ==================== VALIDASI PRIVATE KEY ====================
+DEVICE_FUNC int is_valid_private_key(const uint256_t *key) {
+    // Cek apakah key == 0
+    if (is_zero(key)) {
+        return 0;
+    }
+    
+    // Cek apakah key >= CURVE_N (order of curve)
+    if (compare_u256(key, &CURVE_N) >= 0) {
+        return 0;
+    }
+    
+    // Private key harus antara 1 dan CURVE_N-1
+    uint256_t one;
+    set_one(&one);
+    
+    if (compare_u256(key, &one) < 0) {
+        return 0;  // Kurang dari 1
+    }
+    
+    return 1;
+}
+
+DEVICE_FUNC void add_u256_with_offset(uint256_t *num, unsigned long long offset) {
+    unsigned long long carry = offset;
+    
+    for (int i = 0; i < 8 && carry > 0; i++) {
+        unsigned long long sum = (unsigned long long)num->v[i] + (carry & 0xFFFFFFFF);
+        num->v[i] = (unsigned int)sum;
+        carry = (carry >> 32) + (sum >> 32);
+    }
+    
+    // Jika ada overflow di luar 256-bit, set ke CURVE_N-1
+    if (carry > 0) {
+        // Set ke CURVE_N-1 (maksimum valid)
+        uint256_t max_valid;
+        copy_u256(&max_valid, &CURVE_N);
+        
+        unsigned long long borrow = 1;
+        for (int i = 0; i < 8; i++) {
+            long long diff = (long long)max_valid.v[i] - borrow;
+            if (diff < 0) {
+                max_valid.v[i] = (unsigned int)(diff + 0x100000000ULL);
+                borrow = 1;
+            } else {
+                max_valid.v[i] = (unsigned int)diff;
+                borrow = 0;
+                break;
+            }
+        }
+        copy_u256(num, &max_valid);
+    }
+}
+
+// ==================== MAIN KERNEL ====================
+extern "C" __global__ 
+void crack_secp256k1_multi_gpu(const uint256_t *start_keys,
+                               const uint8_t *target_hash,
+                               struct Result *results,
+                               unsigned long long total_threads) {
+    
+    unsigned long long global_idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (global_idx >= total_threads) return;
+    
+    uint256_t private_key;
+    copy_u256(&private_key, &start_keys[0]);
+    add_u256_with_offset(&private_key, global_idx);
+    
+    // Validasi private key sebelum diproses
+    if (!is_valid_private_key(&private_key)) {
+        results[global_idx].found = 0;
+        return;
+    }
+    
+    jacobian_point pub_key;
+    scalar_multiply_with_lookup(&pub_key, &private_key);
+    
+    if (is_zero(&pub_key.z)) {
+        results[global_idx].found = 0;
+        return;
+    }
+    
+    // Set flag untuk verifikasi CPU
+    results[global_idx].found = 1;
+    copy_u256(&results[global_idx].private_key, &private_key);
+}
+"""
+            
+            mod = SourceModule(
+                cuda_code,
+                options=[
+                    '-O3',
+                    '-use_fast_math',
+                    f'-arch={arch}',
+                ],
+                no_extern_c=False
+            )
+            
+            g_table_x_ptr, _ = mod.get_global("G_TABLE_X")
+            g_table_y_ptr, _ = mod.get_global("G_TABLE_Y")
+            
+            cuda.memcpy_htod(g_table_x_ptr, self.g_table_x)
+            cuda.memcpy_htod(g_table_y_ptr, self.g_table_y)
+            
+            crack_kernel = mod.get_function("crack_secp256k1_multi_gpu")
+            
+            batch_size = calculate_optimal_batch_size(self.gpu_id)
+            block_size = 256
+            grid_size = (batch_size + block_size - 1) // block_size
+            
+            print(f"⚡ GPU {self.gpu_id}: Batch size: {batch_size:,} threads")
+            
+            result_dtype = np.dtype([
+                ('found', np.int32),
+                ('private_key', np.uint32, 8),
+                ('pubkey_hash', np.uint8, 20)
+            ])
+            
+            result_host = cuda.pagelocked_empty(batch_size, dtype=result_dtype)
+            start_keys_ptr = cuda.mem_alloc(32)
+            result_ptr = cuda.mem_alloc(result_host.nbytes)
+            
+            target_hash_bytes = self.target_hash
+            if len(target_hash_bytes) < 20:
+                target_hash_bytes = target_hash_bytes.ljust(20, b'\x00')
+            
+            target_hash_ptr = cuda.mem_alloc(20)
+            cuda.memcpy_htod_async(target_hash_ptr, target_hash_bytes, stream=stream)
+            
+            current_key_int = int(self.min_key, 16)
+            max_key_int = int(self.max_key, 16)
+            
+            total_checked = 0
+            start_time = time.time()
+            last_print = start_time
+            
+            print(f"🔍 GPU {self.gpu_id}: Search started...")
+            
+            while current_key_int < max_key_int and not self.found:
+                current_hex = hex(current_key_int)[2:].zfill(64)
+                key_u256 = hex_to_u256(current_hex)
+                
+                cuda.memcpy_htod_async(start_keys_ptr, key_u256.tobytes(), stream=stream)
+                
+                crack_kernel(
+                    start_keys_ptr,
+                    target_hash_ptr,
+                    result_ptr,
+                    np.uint64(batch_size),
+                    block=(block_size, 1, 1),
+                    grid=(grid_size, 1),
+                    stream=stream
+                )
+                
+                cuda.memcpy_dtoh_async(result_host, result_ptr, stream=stream)
+                stream.synchronize()
+                
+                # Filter keys dengan validasi tambahan
+                for i in range(min(batch_size, max_key_int - current_key_int)):
+                    # Hanya proses jika kernel melaporkan found=1
+                    if result_host[i]['found'] != 1:
+                        continue
+                    
+                    key_parts = result_host[i]['private_key']
+                    recovered_hex = u256_to_hex(key_parts)
+                    
+                    # Skip key yang jelas tidak valid
+                    if recovered_hex == '0' * 64:
+                        continue
+                    
+                    if len(recovered_hex) != 64:
+                        continue
+                    
+                    if verify_private_key(recovered_hex, TARGET_ADDR):
+                        self.found = True
+                        self.result_queue.put({
+                            'gpu_id': self.gpu_id,
+                            'private_key': recovered_hex,
+                            'status': 'FOUND'
+                        })
+                        print(f"🎉 GPU {self.gpu_id}: Found key: {recovered_hex}")
+                        break
+                
+                current_key_int += batch_size
+                total_checked += batch_size
+                
+                current_time = time.time()
+                if current_time - last_print >= 2.0:
+                    elapsed = current_time - start_time
+                    if elapsed > 0:
+                        speed = total_checked / elapsed
+                        progress_pct = min(100.0, (current_key_int - int(self.min_key, 16)) / 
+                                         (max_key_int - int(self.min_key, 16)) * 100)
+                        
+                        current_disp = hex(current_key_int)[2:].zfill(64)
+                        print(f"GPU {self.gpu_id} | Speed: {speed/1_000_000:.2f} MKeys/s | "
+                              f"Progress: {progress_pct:.2f}% | Current: ...{current_disp[-16:]}")
+                        last_print = current_time
+                
+                if self.found:
+                    break
+            
+            if not self.found:
+                self.result_queue.put({
+                    'gpu_id': self.gpu_id,
+                    'status': 'COMPLETED',
+                    'keys_checked': total_checked
+                })
+                
+        except Exception as e:
+            print(f"❌ GPU {self.gpu_id}: Error - {e}")
+            import traceback
+            traceback.print_exc()
+            self.result_queue.put({
+                'gpu_id': self.gpu_id,
+                'status': 'ERROR',
+                'error': str(e)
+            })
+        finally:
+            if context:
+                context.pop()
+
+# ==================== MULTI-GPU MANAGER ====================
+class MultiGPUManager:
+    def __init__(self):
+        try:
+            cuda.init()
+            self.num_gpus = cuda.Device.count()
+            print(f"🔧 Found {self.num_gpus} GPU(s)")
+        except:
+            self.num_gpus = 0
+            print("⚠️ No CUDA-capable GPU found or CUDA not installed")
+        
+        # Run tests
+        print("\n🔧 Running tests...")
+        ripemd160_ok = test_ripemd160()
+        bitcoin_ok = test_bitcoin_address_generation()
+        
+        # Test GPU libraries
+        test_gpu_libraries()
+        
+        if not ripemd160_ok or not bitcoin_ok:
+            print("❌ Critical tests failed. Exiting.")
+            sys.exit(1)
+    
+    def start_search(self, target_addr):
+        print(f"\n{'='*60}")
+        print(f"🎯 TARGET ADDRESS: {target_addr}")
+        print(f"🔍 SEARCH RANGE: {MIN_RANGE} to {MAX_RANGE}")
+        print(f"{'='*60}")
+        
+        try:
+            target_hash = address_to_hash160(target_addr)
+            print(f"📝 Target Hash160: {target_hash.hex()}")
+            
+            g_table_x, g_table_y = precompute_g_table_cpu()
+        except Exception as e:
+            print(f"❌ Initialization Error: {e}")
+            return
+        
+        min_int = int(MIN_RANGE, 16)
+        max_int = int(MAX_RANGE, 16)
+        total_keys = max_int - min_int
+        
+        print(f"📊 Total keys to search: {total_keys:,}")
+        
+        if self.num_gpus == 0:
+            print("❌ No GPUs available for CUDA computation")
+            return
+        
+        gpu_ids = GPU_IDS if not USE_ALL_GPUS else list(range(self.num_gpus))
+        if not gpu_ids:
+            print("❌ No GPUs available")
+            return
+        
+        print(f"🚀 Using {len(gpu_ids)} GPU(s): {gpu_ids}")
+        
+        range_per_gpu = total_keys // len(gpu_ids)
+        processes = []
+        result_queue = mp.Queue()
+        
+        for i, gpu_id in enumerate(gpu_ids):
+            sub_min = min_int + (i * range_per_gpu)
+            sub_max = sub_min + range_per_gpu if i < len(gpu_ids) - 1 else max_int
+            sub_min = max(sub_min, min_int)
+            sub_max = min(sub_max, max_int)
+            
+            p = mp.Process(
+                target=worker_wrapper,
+                args=(gpu_id, hex(sub_min)[2:], hex(sub_max)[2:], target_hash, g_table_x, g_table_y, result_queue)
+            )
+            p.daemon = True
+            p.start()
+            processes.append(p)
+            time.sleep(0.5)
+        
+        print(f"\n🔍 Search started at {time.strftime('%H:%M:%S')}")
+        print("Press Ctrl+C to stop\n")
+        
+        found = False
+        completed = 0
+        errors = 0
+        start_time = time.time()
+        
+        try:
+            while completed + errors < len(processes) and not found:
+                try:
+                    res = result_queue.get(timeout=5)
+                    
+                    if res['status'] == 'FOUND':
+                        found = True
+                        private_key = res['private_key']
+                        print(f"\n{'='*60}")
+                        print(f"🎉 KEY FOUND! GPU {res['gpu_id']} 🎉")
+                        print(f"KEY: {private_key}")
+                        print(f"{'='*60}")
+                        with open('found_key.txt', 'w') as f:
+                            f.write(private_key)
+                        break
+                        
+                    elif res['status'] == 'COMPLETED':
+                        completed += 1
+                        print(f"✅ GPU {res['gpu_id']}: Completed ({res['keys_checked']:,} keys checked)")
+                        
+                    elif res['status'] == 'ERROR':
+                        errors += 1
+                        print(f"❌ GPU {res['gpu_id']}: Error - {res['error']}")
+                        
+                except:
+                    if not any(p.is_alive() for p in processes):
+                        break
+                    continue
+            
+            elapsed = time.time() - start_time
+            
+            if not found:
+                print(f"\n❌ Key not found in range {MIN_RANGE}-{MAX_RANGE}")
+            
+            print(f"\n📊 Summary:")
+            print(f"  Time elapsed: {elapsed:.2f}s")
+            print(f"  GPUs completed: {completed}/{len(gpu_ids)}")
+            print(f"  GPUs with errors: {errors}")
+            
+        except KeyboardInterrupt:
+            print("\n⚠️ Interrupted by user")
+        finally:
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+
+def worker_wrapper(gpu_id, min_k, max_k, t_hash, gx, gy, q):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    worker = GPUWorker(gpu_id, min_k, max_k, t_hash, gx, gy, q)
+    worker.run()
+
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
+    manager = MultiGPUManager()
+    manager.start_search(TARGET_ADDR)
