@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Upgraded BSGS GPU Tool dengan G-Table Precomputation dan Window Method
+Upgraded BSGS GPU Tool dengan G-Table Precomputation
 Search 1 pubkey dengan BSGS algorithm menggunakan GPU
 """
 
@@ -45,8 +45,8 @@ def u256_to_hex(u32_array):
     return format(val, '064x')
 
 def precompute_g_table():
-    """Precompute G lookup table for window method"""
-    print("⚙️ Precomputing G-Table for window method...")
+    """Precompute G lookup table untuk optimasi CPU"""
+    print("⚙️ Precomputing G-Table for CPU optimization...")
     
     # Hardcoded G point coordinates (secp256k1 generator)
     Gx = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
@@ -56,13 +56,12 @@ def precompute_g_table():
     table_x = []
     table_y = []
     
-    # Entry 0 (point at infinity - akan ditangani khusus di kernel)
+    # Entry 0 (point at infinity)
     table_x.append(np.zeros(8, dtype=np.uint32))
     table_y.append(np.zeros(8, dtype=np.uint32))
     
-    # Compute G * i for i = 1..15
+    # Compute G * i for i = 1..15 menggunakan library secp256k1_lib
     for i in range(1, 16):
-        # Compute G * i menggunakan library secp256k1_lib
         pubkey_bytes = ice.scalar_multiplication(i)
         
         # Parse uncompressed pubkey (65 bytes): 04 + X(32) + Y(32)
@@ -73,7 +72,7 @@ def precompute_g_table():
         table_x.append(hex_to_u256(x_hex))
         table_y.append(hex_to_u256(y_hex))
         
-        if i <= 3:  # Debug info untuk beberapa entry pertama
+        if i <= 3:
             print(f"  G[{i}] = ({x_hex[:16]}..., {y_hex[:16]}...)")
     
     return np.array(table_x).flatten(), np.array(table_y).flatten()
@@ -95,7 +94,7 @@ def load_bsgs_gpu_library():
     pathdll = os.path.realpath(dllfile)
     bsgsgpu = ctypes.CDLL(pathdll)
     
-    # Define argument types
+    # Define argument types untuk fungsi original bsgsGPU
     bsgsgpu.bsgsGPU.argtypes = [
         ctypes.c_uint32,  # threads
         ctypes.c_uint32,  # blocks
@@ -105,29 +104,12 @@ def load_bsgs_gpu_library():
         ctypes.c_char_p,  # upubs
         ctypes.c_uint32,  # size
         ctypes.c_char_p,  # keyspace
-        ctypes.c_char_p,  # bp_size
-        ctypes.c_void_p,  # g_table_x (new)
-        ctypes.c_void_p   # g_table_y (new)
+        ctypes.c_char_p   # bp_size
     ]
     bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
     bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
     
-    # New GPU kernel dengan window method
-    bsgsgpu.bsgsGPU_window.argtypes = [
-        ctypes.c_uint32,  # threads
-        ctypes.c_uint32,  # blocks
-        ctypes.c_uint32,  # points
-        ctypes.c_uint32,  # gpu_bits
-        ctypes.c_int,     # device
-        ctypes.c_char_p,  # upubs
-        ctypes.c_uint32,  # size
-        ctypes.c_char_p,  # keyspace
-        ctypes.c_char_p,  # bp_size
-        ctypes.c_void_p,  # g_table_x
-        ctypes.c_void_p   # g_table_y
-    ]
-    bsgsgpu.bsgsGPU_window.restype = ctypes.c_void_p
-    
+    print(f"   ✓ Loaded library: {dllfile}")
     return bsgsgpu
 
 def pub2upub(pub_hex):
@@ -137,29 +119,16 @@ def pub2upub(pub_hex):
         x = int(pub_hex[2:66], 16)
         y = int(pub_hex[66:], 16)
     elif len(pub_hex) == 66 and pub_hex.startswith(('02', '03')):
-        # Compressed - perlu decompress
-        from ecdsa.curves import SECP256k1
-        import ecdsa
-        
-        # Gunakan library bit untuk decompress
+        # Compressed - decompress menggunakan bit library
         try:
-            # Coba gunakan bit library
             pk = bit.Key(pub_hex)
             x_hex = format(pk.public_point.x(), '064x')
             y_hex = format(pk.public_point.y(), '064x')
             x = int(x_hex, 16)
             y = int(y_hex, 16)
-        except:
-            # Fallback ke manual calculation
-            x = int(pub_hex[2:], 16)
-            # Hitung y dari x
-            curve = SECP256k1.curve
-            y_sq = (pow(x, 3, curve.p()) + curve.a() * x + curve.b()) % curve.p()
-            y = pow(y_sq, (curve.p() + 1) // 4, curve.p())
-            
-            # Sesuaikan parity
-            if (y % 2) != (int(pub_hex[:2], 16) % 2):
-                y = curve.p() - y
+        except Exception as e:
+            print(f"   ✗ Error decompressing pubkey: {e}")
+            sys.exit(1)
     else:
         raise ValueError("Invalid public key format")
     
@@ -177,18 +146,17 @@ def save_found_key(private_key_hex, public_key_hex):
 # ==================== MAIN PROGRAM ====================
 def main():
     print('\n' + '='*70)
-    print('BSGS GPU SEARCH dengan Window Method Optimization')
+    print('BSGS GPU SEARCH (Optimized)')
     print('='*70)
     
-    # Precompute G-Table
+    # Precompute G-Table (untuk referensi/future use)
     print("\n[1] Precomputing lookup tables...")
     g_table_x, g_table_y = precompute_g_table()
-    print(f"   ✓ G-Table computed: {len(g_table_x)//8} entries")
+    print(f"   ✓ G-Table computed: {len(g_table_x)//8} entries (CPU only)")
     
     # Load GPU library
     print("\n[2] Loading GPU library...")
     bsgsgpu = load_bsgs_gpu_library()
-    print(f"   ✓ GPU library loaded successfully")
     
     # Convert target public key
     print("\n[3] Processing target public key...")
@@ -246,12 +214,8 @@ def main():
             # Start timer for this search
             start_time = time.time()
             
-            # Prepare GPU buffers untuk G-Table
-            g_table_x_ptr = ctypes.c_void_p(g_table_x.ctypes.data)
-            g_table_y_ptr = ctypes.c_void_p(g_table_y.ctypes.data)
-            
-            # Call GPU kernel dengan window method
-            res = bsgsgpu.bsgsGPU_window(
+            # Call ORIGINAL GPU kernel (bsgsGPU)
+            res = bsgsgpu.bsgsGPU(
                 GPU_THREADS,            # threads
                 GPU_BLOCKS,             # blocks  
                 GPU_POINTS,             # points per thread
@@ -260,9 +224,7 @@ def main():
                 P3,                     # upubs
                 len(P3) // 65,          # size
                 st_en.encode('utf8'),   # keyspace
-                str(BP_TABLE_SIZE).encode('utf8'),  # bp_size
-                g_table_x_ptr,          # g_table_x
-                g_table_y_ptr           # g_table_y
+                str(BP_TABLE_SIZE).encode('utf8')  # bp_size
             )
             
             end_time = time.time()
@@ -291,10 +253,10 @@ def main():
                     foundpub = bit.Key.from_int(int(pvk, 16)).public_key
                     
                     # Cari di P3 table
-                    found_bytes = bytes.fromhex(foundpub[2:])  # Remove '04' prefix
-                    idx = P3.find(found_bytes[0:32])  # Cari X coordinate
+                    found_bytes = bytes.fromhex(foundpub[2:])
+                    idx = P3.find(found_bytes[0:32])
                     
-                    if idx >= 0 and idx % 65 == 1:  # Check jika ditemukan di posisi yang benar
+                    if idx >= 0 and idx % 65 == 1:
                         BSGS_Key = int(pvk, 16) - (((idx - 1) // 65) + 1)
                         private_key_hex = hex(BSGS_Key)
                         
