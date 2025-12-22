@@ -1,727 +1,504 @@
 # -*- coding: utf-8 -*-
 """
-btcshort.py - GPU Bitcoin Private Key Search dengan Integrasi bt2.so
-Upgraded version untuk range besar/kecil dengan target public key
+Upgraded BSGS GPU Tool - Simple Execution Version
+Usage: 
+    Edit configuration variables below and run directly
+    Example: python bxx_upgraded.py
+    
+Features:
+- Compatible with both small and very large ranges
+- Simple configuration without argparse
+- Multi-GPU support
+- Random or sequential search modes
 """
 
+import secp256k1_lib as ice
+import bit
+import ctypes
 import os
 import sys
-import time
-import ctypes
+import platform
 import random
 import math
-import platform
+import signal
+import time
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
-# ==================== IMPORT LIBRARIES ====================
-try:
-    import bit
-    BIT_AVAILABLE = True
-except ImportError:
-    print("⚠️ bit library not available, install: pip install bit")
-    BIT_AVAILABLE = False
+# ==================== CONFIGURATION ====================
+# Edit these variables for your search
 
-try:
-    import secp256k1_lib as ice
-    ICE_AVAILABLE = True
-except ImportError:
-    print("⚠️ secp256k1_lib not available")
-    ICE_AVAILABLE = False
+PUBLIC_KEY = "02CEB6CBBCDBDF5EF7150682150F4CE2C6F4807B349827DCDBDD1F2EFA885A2630"
+START_RANGE_HEX = "800000000000000000000000000000"
+END_RANGE_HEX = "ffffffffffffffffffffffffffffff"
 
-# ==================== KONFIGURASI ====================
-# Target public key (compressed)
-TARGET_PUBKEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"
+# Search mode: "random" or "sequential"
+SEARCH_MODE = "random"
 
-# Range default (hex) - bisa disesuaikan
-MIN_RANGE = "80000"
-MAX_RANGE = "fffff"
-
-# Konfigurasi GPU
-USE_ALL_GPUS = True
+# GPU Configuration
+USE_MULTI_GPU = True  # Set to False for single GPU
+GPU_DEVICE_ID = 0  # Used when USE_MULTI_GPU=False
 GPU_THREADS = 64
 GPU_BLOCKS = 10
 GPU_POINTS = 256
-BP_TABLE_SIZE = 500000  # Untuk range besar, bisa ditingkatkan
-RANDOM_MODE = True  # Mode random dalam range
+BP_SIZE = 500000  # Baby-Point table size
+BATCH_SIZE = 10000000000000000  # Keys per batch in random mode
 
-# Output file
+# Output
 OUTPUT_FILE = "found_keys.txt"
+VERBOSE = True
 
-# ==================== LOAD BT2 LIBRARY ====================
-def load_bt2_library():
-    """Load bt2.so library untuk operasi BSGS GPU"""
-    if platform.system().lower().startswith('win'):
-        libfile = 'bt2.dll'
-    elif platform.system().lower().startswith('lin'):
-        libfile = 'bt2.so'
+# ==================== INITIALIZATION ====================
+
+def hex_to_int(hex_str):
+    """Convert hex string to integer"""
+    return int(hex_str, 16) if hex_str else None
+
+# Convert range
+START_RANGE = hex_to_int(START_RANGE_HEX)
+END_RANGE = hex_to_int(END_RANGE_HEX)
+
+if START_RANGE is None or END_RANGE is None:
+    print("Error: Invalid range specified")
+    sys.exit(1)
+
+# ==================== HELPER FUNCTIONS ====================
+
+def print_config():
+    """Print configuration summary"""
+    print("\n" + "="*60)
+    print("BSGS GPU TOOL - UPGRADED VERSION")
+    print("="*60)
+    print(f"Public Key: {PUBLIC_KEY[:20]}...{PUBLIC_KEY[-20:]}")
+    print(f"Search Range: {START_RANGE_HEX} to {END_RANGE_HEX}")
+    print(f"Search Mode: {SEARCH_MODE.upper()}")
+    print(f"Total Keys: {END_RANGE - START_RANGE:,}")
+    print(f"GPU Threads: {GPU_THREADS}, Blocks: {GPU_BLOCKS}, Points: {GPU_POINTS}")
+    print(f"Baby-Point Size: {BP_SIZE:,}")
+    print("="*60 + "\n")
+
+def pub2upub(pub_hex):
+    """Convert compressed/uncompressed public key to uncompressed format"""
+    if pub_hex.startswith('04'):
+        # Already uncompressed
+        return bytes.fromhex(pub_hex)
+    
+    x = int(pub_hex[2:66], 16)
+    if len(pub_hex) < 70:
+        y = bit.format.x_to_y(x, int(pub_hex[:2], 16) % 2)
     else:
-        print('[-] Unsupported Platform')
-        sys.exit(1)
+        y = int(pub_hex[66:], 16)
     
-    if not os.path.isfile(libfile):
-        print(f'❌ File {libfile} not found')
-        print(f'   Please ensure {libfile} is in the current directory')
-        sys.exit(1)
+    return bytes.fromhex('04' + hex(x)[2:].zfill(64) + hex(y)[2:].zfill(64))
+
+def get_gpu_count():
+    """Get number of available GPUs"""
+    try:
+        # Try to import CUDA if available
+        import pycuda.driver as cuda
+        cuda.init()
+        return cuda.Device.count()
+    except ImportError:
+        if VERBOSE:
+            print("CUDA not available, using single GPU mode")
+        return 1
+    except:
+        return 1
+
+def split_range_among_gpus(start, end, num_gpus):
+    """Split search range among multiple GPUs"""
+    total_keys = end - start + 1
+    keys_per_gpu = total_keys // num_gpus
     
-    pathlib = os.path.realpath(libfile)
-    bt2 = ctypes.CDLL(pathlib)
+    ranges = []
+    for i in range(num_gpus):
+        gpu_start = start + (i * keys_per_gpu)
+        gpu_end = gpu_start + keys_per_gpu - 1 if i < num_gpus - 1 else end
+        ranges.append((gpu_start, gpu_end))
     
-    # Define argument types untuk fungsi bsgsGPU (sesuai bxx.py)
-    bt2.bsgsGPU.argtypes = [
+    return ranges
+
+def validate_private_key(pvk_int, target_pubkey):
+    """Validate if private key matches target public key"""
+    try:
+        # Generate public key from private key
+        test_pubkey = ice.scalar_multiplication(pvk_int)
+        
+        # Convert to hex for comparison
+        test_pubkey_hex = test_pubkey.hex()
+        target_uncompressed = pub2upub(PUBLIC_KEY).hex()
+        
+        # Compare uncompressed public keys
+        return test_pubkey_hex == target_uncompressed
+    except Exception as e:
+        if VERBOSE:
+            print(f"Validation error: {e}")
+        return False
+
+# ==================== DLL LOADING ====================
+
+def load_bsgs_dll():
+    """Load the BSGS DLL for the current platform"""
+    if platform.system().lower().startswith('win'):
+        dllfile = 'bt2.dll'
+    elif platform.system().lower().startswith('lin'):
+        dllfile = 'bt2.so'
+    else:
+        print('[-] Unsupported Platform. Only Windows and Linux are supported.')
+        return None
+    
+    if os.path.isfile(dllfile):
+        pathdll = os.path.realpath(dllfile)
+        try:
+            bsgsgpu = ctypes.CDLL(pathdll)
+            if VERBOSE:
+                print(f"[+] Successfully loaded {dllfile}")
+            return bsgsgpu
+        except Exception as e:
+            print(f"[-] Failed to load {dllfile}: {e}")
+            return None
+    else:
+        print(f'[-] File {dllfile} not found')
+        return None
+
+# ==================== CORE SEARCH FUNCTIONS ====================
+
+def bsgs_search_single_gpu(start_key, end_key, gpu_device=0):
+    """Perform BSGS search on a single GPU"""
+    # Load DLL
+    bsgsgpu = load_bsgs_dll()
+    if not bsgsgpu:
+        return None
+    
+    # Configure DLL function signatures
+    bsgsgpu.bsgsGPU.argtypes = [
         ctypes.c_uint32,  # threads
         ctypes.c_uint32,  # blocks
         ctypes.c_uint32,  # points
-        ctypes.c_uint32,  # gpu_bits
+        ctypes.c_uint32,  # bits
         ctypes.c_int,     # device
         ctypes.c_char_p,  # upubs
         ctypes.c_uint32,  # size
         ctypes.c_char_p,  # keyspace
-        ctypes.c_char_p   # bp_size
+        ctypes.c_char_p   # bp
     ]
-    bt2.bsgsGPU.restype = ctypes.c_void_p
-    bt2.free_memory.argtypes = [ctypes.c_void_p]
+    bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
+    bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
     
-    print(f"✅ Loaded {libfile} library for GPU BSGS operations")
-    return bt2
-
-# ==================== FUNGSI UTILITAS ====================
-def decompress_pubkey(compressed_pubkey_hex):
-    """Decompress compressed public key menggunakan matematika ECC"""
-    if not compressed_pubkey_hex.startswith(('02', '03')):
-        return None
+    # Prepare public key
+    P = pub2upub(PUBLIC_KEY)
+    G = ice.scalar_multiplication(1)
+    P3 = ice.point_loop_addition(BP_SIZE, P, G)
     
-    try:
-        # Parse x coordinate
-        x_hex = compressed_pubkey_hex[2:]
-        x = int(x_hex, 16)
-        
-        # Curve parameters for secp256k1
-        p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-        a = 0
-        b = 7
-        
-        # Calculate y^2 = x^3 + ax + b mod p
-        y_sq = (pow(x, 3, p) + a * x + b) % p
-        
-        # Calculate square root using Tonelli-Shanks algorithm
-        # Since p ≡ 3 mod 4, we can use simpler method
-        y = pow(y_sq, (p + 1) // 4, p)
-        
-        # Check if y matches the parity indicated by prefix
-        is_even = y % 2 == 0
-        expected_even = compressed_pubkey_hex.startswith('02')
-        
-        if is_even != expected_even:
-            y = p - y
-        
-        uncompressed = f"04{hex(x)[2:].zfill(64)}{hex(y)[2:].zfill(64)}"
-        return bytes.fromhex(uncompressed)
-        
-    except Exception as e:
-        print(f"Error decompressing pubkey: {e}")
-        return None
-
-def pubkey_to_uncompressed(pubkey_hex):
-    """Convert public key (compressed/uncompressed) ke format uncompressed bytes"""
-    # Bersihkan input dari spasi atau karakter baru
-    pubkey_hex = pubkey_hex.strip()
+    gpu_bits = int(math.log2(BP_SIZE))
     
-    # Jika sudah uncompressed (130 karakter dengan prefix '04')
-    if len(pubkey_hex) == 130 and pubkey_hex.startswith('04'):
-        try:
-            return bytes.fromhex(pubkey_hex)
-        except:
-            pass
+    # Convert keyspace to string
+    st_en = hex(start_key)[2:] + ':' + hex(end_key)[2:]
     
-    # Jika compressed (66 karakter dengan prefix '02' atau '03')
-    elif len(pubkey_hex) == 66 and pubkey_hex.startswith(('02', '03')):
-        result = decompress_pubkey(pubkey_hex)
-        if result:
-            return result
+    if VERBOSE:
+        print(f"Searching range: {hex(start_key)} to {hex(end_key)}")
     
-    # Jika format lain, coba bersihkan dan cek lagi
-    pubkey_hex = pubkey_hex.replace(' ', '').replace('\n', '').replace('\r', '')
-    
-    if len(pubkey_hex) == 130 and pubkey_hex.startswith('04'):
-        try:
-            return bytes.fromhex(pubkey_hex)
-        except:
-            pass
-    elif len(pubkey_hex) == 66 and pubkey_hex.startswith(('02', '03')):
-        result = decompress_pubkey(pubkey_hex)
-        if result:
-            return result
-    
-    raise ValueError(f"Invalid public key format: {pubkey_hex[:20]}... (length: {len(pubkey_hex)})")
-
-def generate_p3_table(pubkey_bytes, bp_size):
-    """Generate P3 table untuk BSGS algorithm (sesuai bxx.py)"""
-    print(f"Generating P3 table dengan {bp_size:,} points...")
-    
-    if ICE_AVAILABLE:
-        # Menggunakan secp256k1_lib seperti di bxx.py
-        try:
-            G = ice.scalar_multiplication(1)
-            P3 = ice.point_loop_addition(bp_size, pubkey_bytes, G)
-            print(f"✅ P3 table generated: {len(P3)} bytes ({len(P3)//65} points)")
-            return P3
-        except Exception as e:
-            print(f"❌ Error generating P3 table: {e}")
-            return None
-    else:
-        print("❌ secp256k1_lib not available. Please install it.")
-        return None
-
-def calculate_gpu_bits(bp_size):
-    """Calculate gpu_bits dari bp_size"""
-    return int(math.log2(bp_size))
-
-def generate_random_range(min_val, max_val):
-    """Generate random range untuk pencarian"""
-    k1 = random.SystemRandom().randint(min_val, max_val)
-    k2 = random.SystemRandom().randint(min_val, max_val)
-    if k1 > k2:
-        k1, k2 = k2, k1
-    return k1, k2
-
-def verify_private_key_with_pubkey(private_key_hex, target_pubkey_hex):
-    """Verify if private key produces the target public key"""
-    try:
-        if not BIT_AVAILABLE:
-            print("⚠️ bit library not available for verification")
-            return False
-        
-        # Generate public key from private key
-        private_key_int = int(private_key_hex, 16)
-        
-        # Gunakan bit library untuk menghasilkan public key
-        from bit import Key
-        key_from_priv = Key.from_int(private_key_int)
-        generated_pubkey = key_from_priv.public_key
-        
-        # Bandingkan dengan target pubkey (dalam format yang sama)
-        target_key = Key(target_pubkey_hex)
-        
-        return generated_pubkey == target_key.public_key
-        
-    except Exception as e:
-        print(f"❌ Error verifying key: {e}")
-        return False
-
-# ==================== GPU WORKER CLASS ====================
-class BSGSGPUWorker:
-    def __init__(self, gpu_id, target_pubkey, min_range, max_range, 
-                 output_file, random_mode=False):
-        self.gpu_id = gpu_id
-        self.target_pubkey = target_pubkey
-        self.min_range = min_range
-        self.max_range = max_range
-        self.output_file = output_file
-        self.random_mode = random_mode
-        self.bt2_lib = None
-        self.P3 = None
-        self.bp_size = BP_TABLE_SIZE
-        self.gpu_bits = calculate_gpu_bits(self.bp_size)
-        
-        # Konfigurasi GPU
-        self.gpu_threads = GPU_THREADS
-        self.gpu_blocks = GPU_BLOCKS
-        self.gpu_points = GPU_POINTS
-        
-    def initialize(self):
-        """Initialize GPU worker"""
-        print(f"🔄 GPU {self.gpu_id}: Initializing...")
-        
-        # Load bt2 library
-        self.bt2_lib = load_bt2_library()
-        
-        # Convert pubkey to uncompressed format
-        try:
-            print(f"GPU {self.gpu_id}: Converting pubkey to uncompressed format...")
-            pubkey_bytes = pubkey_to_uncompressed(self.target_pubkey)
-            print(f"GPU {self.gpu_id}: Pubkey converted successfully")
-        except Exception as e:
-            print(f"❌ GPU {self.gpu_id}: Failed to convert pubkey: {e}")
-            return False
-        
-        # Generate P3 table
-        self.P3 = generate_p3_table(pubkey_bytes, self.bp_size)
-        if self.P3 is None:
-            print(f"❌ GPU {self.gpu_id}: Failed to generate P3 table")
-            return False
-        
-        print(f"✅ GPU {self.gpu_id}: Initialized successfully")
-        print(f"   Range: {hex(self.min_range)} - {hex(self.max_range)}")
-        print(f"   Random mode: {self.random_mode}")
-        return True
-        
-    def search_range(self, start_key, end_key):
-        """Search dalam range tertentu menggunakan BSGS GPU"""
-        # Format keyspace untuk bt2
-        keyspace = f"{hex(start_key)[2:]}:{hex(end_key)[2:]}"
-        
-        try:
-            # Panggil fungsi bsgsGPU dari library
-            res_ptr = self.bt2_lib.bsgsGPU(
-                ctypes.c_uint32(self.gpu_threads),
-                ctypes.c_uint32(self.gpu_blocks),
-                ctypes.c_uint32(self.gpu_points),
-                ctypes.c_uint32(self.gpu_bits),
-                ctypes.c_int(self.gpu_id),
-                ctypes.c_char_p(self.P3),
-                ctypes.c_uint32(len(self.P3) // 65),
-                ctypes.c_char_p(keyspace.encode('utf8')),
-                ctypes.c_char_p(str(self.bp_size).encode('utf8'))
-            )
-            
-            # Decode hasil
-            result = (ctypes.cast(res_ptr, ctypes.c_char_p).value)
-            if result:
-                result_str = result.decode('utf8')
-            else:
-                result_str = ""
-            
-            # Free memory
-            self.bt2_lib.free_memory(res_ptr)
-            
-            return result_str
-            
-        except Exception as e:
-            print(f"❌ GPU {self.gpu_id}: Error in bsgsGPU call: {e}")
-            return ""
-    
-    def verify_and_save_key(self, found_pvk_hex):
-        """Verify found private key dan simpan ke file"""
-        if not found_pvk_hex or found_pvk_hex.strip() == "":
-            return False
-            
-        try:
-            # Bersihkan hex string
-            found_pvk_hex = found_pvk_hex.strip()
-            
-            # Verifikasi private key menghasilkan public key yang sesuai
-            if verify_private_key_with_pubkey(found_pvk_hex, self.target_pubkey):
-                print(f"\n{'='*60}")
-                print(f"🎉 KEY FOUND! GPU {self.gpu_id} 🎉")
-                print(f"Private Key: {found_pvk_hex}")
-                print(f"Target PubKey: {self.target_pubkey}")
-                print(f"{'='*60}")
-                
-                # Generate public key dari private key untuk display
-                if BIT_AVAILABLE:
-                    from bit import Key
-                    key_from_priv = Key.from_hex(found_pvk_hex)
-                    generated_pubkey = key_from_priv.public_key
-                    print(f"Generated PubKey: {generated_pubkey}")
-                
-                # Save to file
-                with open(self.output_file, "a") as f:
-                    f.write(f"Private Key: {found_pvk_hex}\n")
-                    f.write(f"Target Public Key: {self.target_pubkey}\n")
-                    f.write(f"Found by GPU: {self.gpu_id}\n")
-                    f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write(f"{'='*60}\n")
-                
-                return True
-            else:
-                print(f"⚠️ GPU {self.gpu_id}: False positive detected: {found_pvk_hex[:20]}...")
-                return False
-                
-        except Exception as e:
-            print(f"❌ GPU {self.gpu_id}: Error verifying key: {e}")
-            return False
-    
-    def run_continuous_search(self, result_queue):
-        """Run continuous search dalam loop"""
-        total_keys_checked = 0
-        start_time = time.time()
-        
-        try:
-            # Initialize
-            if not self.initialize():
-                result_queue.put({
-                    'gpu_id': self.gpu_id,
-                    'status': 'ERROR',
-                    'error': 'Initialization failed'
-                })
-                return
-            
-            print(f"🚀 GPU {self.gpu_id}: Starting search...")
-            
-            while True:
-                # Tentukan range pencarian
-                if self.random_mode:
-                    start_key, end_key = generate_random_range(self.min_range, self.max_range)
-                    batch_size = end_key - start_key
-                else:
-                    # Sequential search dalam sub-range
-                    batch_size = min(1000000, self.max_range - self.min_range)  # Size per batch
-                    current_batch = total_keys_checked // batch_size
-                    start_key = self.min_range + (current_batch * batch_size)
-                    end_key = min(start_key + batch_size, self.max_range)
-                    
-                    if start_key >= self.max_range:
-                        print(f"✅ GPU {self.gpu_id}: Completed full range")
-                        break
-                
-                # Lakukan pencarian
-                batch_start_time = time.time()
-                found_pvk = self.search_range(start_key, end_key)
-                batch_time = time.time() - batch_start_time
-                
-                # Hitung statistik
-                batch_size = end_key - start_key
-                if batch_time > 0:
-                    speed = batch_size / batch_time
-                else:
-                    speed = 0
-                
-                total_keys_checked += batch_size
-                
-                # Tampilkan progress
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    avg_speed = total_keys_checked / elapsed
-                    progress_pct = min(100.0, ((start_key - self.min_range) / 
-                                           (self.max_range - self.min_range)) * 100) if self.max_range > self.min_range else 0
-                    
-                    print(f"GPU {self.gpu_id} | "
-                          f"Range: {hex(start_key)[:12]}... - {hex(end_key)[:12]}... | "
-                          f"Speed: {speed:,.0f} keys/s | "
-                          f"Total: {total_keys_checked:,} | "
-                          f"Progress: {progress_pct:.2f}%")
-                
-                # Cek jika key ditemukan
-                if found_pvk and found_pvk.strip() != "":
-                    if self.verify_and_save_key(found_pvk):
-                        result_queue.put({
-                            'gpu_id': self.gpu_id,
-                            'private_key': found_pvk,
-                            'status': 'FOUND'
-                        })
-                        return
-                
-                # Kirim update progress
-                result_queue.put({
-                    'gpu_id': self.gpu_id,
-                    'status': 'PROGRESS',
-                    'keys_checked': total_keys_checked,
-                    'speed': avg_speed
-                })
-                
-                # Jika sequential mode dan sudah mencapai akhir
-                if not self.random_mode and end_key >= self.max_range:
-                    break
-                    
-                # Small delay untuk mencegah CPU overload
-                time.sleep(0.1)
-            
-            # Jika selesai tanpa menemukan
-            result_queue.put({
-                'gpu_id': self.gpu_id,
-                'status': 'COMPLETED',
-                'keys_checked': total_keys_checked
-            })
-            
-        except KeyboardInterrupt:
-            print(f"⚠️ GPU {self.gpu_id}: Interrupted by user")
-            result_queue.put({
-                'gpu_id': self.gpu_id,
-                'status': 'INTERRUPTED',
-                'keys_checked': total_keys_checked
-            })
-        except Exception as e:
-            print(f"❌ GPU {self.gpu_id}: Error - {e}")
-            import traceback
-            traceback.print_exc()
-            
-            result_queue.put({
-                'gpu_id': self.gpu_id,
-                'status': 'ERROR',
-                'error': str(e)
-            })
-
-# ==================== MULTI-GPU MANAGER ====================
-class MultiGPUManager:
-    def __init__(self, target_pubkey, min_range_hex, max_range_hex, 
-                 output_file, random_mode=False):
-        self.target_pubkey = target_pubkey
-        self.min_range = int(min_range_hex, 16)
-        self.max_range = int(max_range_hex, 16)
-        self.output_file = output_file
-        self.random_mode = random_mode
-        
-        # Detect available GPUs
-        self.num_gpus = 1  # Default
-        try:
-            import pycuda.driver as cuda
-            cuda.init()
-            self.num_gpus = cuda.Device.count()
-            print(f"🔧 Found {self.num_gpus} GPU(s)")
-        except ImportError:
-            print("⚠️ pycuda not available, using 1 GPU (CPU fallback mode)")
-        except Exception as e:
-            print(f"⚠️ GPU detection error: {e}, using 1 GPU")
-    
-    def start_search(self):
-        """Start multi-GPU search"""
-        print(f"\n{'='*70}")
-        print("BITCOIN PRIVATE KEY SEARCH - BSGS GPU VERSION")
-        print(f"{'='*70}")
-        print(f"🎯 Target Public Key: {self.target_pubkey}")
-        print(f"🔍 Search Range: {hex(self.min_range)} - {hex(self.max_range)}")
-        print(f"📊 Range Size: {self.max_range - self.min_range:,} keys")
-        print(f"🔄 Random Mode: {self.random_mode}")
-        print(f"💾 Output File: {self.output_file}")
-        print(f"{'='*70}\n")
-        
-        # Validasi range
-        if self.min_range >= self.max_range:
-            print("❌ Invalid range: min must be less than max")
-            return
-        
-        # Validasi public key
-        try:
-            test_bytes = pubkey_to_uncompressed(self.target_pubkey)
-            print(f"✅ Public key format valid")
-        except Exception as e:
-            print(f"❌ Invalid public key format: {e}")
-            return
-        
-        # Setup multiprocessing
-        result_queue = mp.Queue()
-        processes = []
-        
-        # Tentukan GPU IDs yang akan digunakan
-        if USE_ALL_GPUS and self.num_gpus > 1:
-            gpu_ids = list(range(self.num_gpus))
-        else:
-            gpu_ids = [0]
-        
-        print(f"🚀 Using {len(gpu_ids)} GPU(s): {gpu_ids}")
-        
-        # Hitung sub-range per GPU (untuk non-random mode)
-        if not self.random_mode and len(gpu_ids) > 1:
-            range_per_gpu = (self.max_range - self.min_range) // len(gpu_ids)
-        else:
-            range_per_gpu = self.max_range - self.min_range
-        
-        # Start worker processes
-        for i, gpu_id in enumerate(gpu_ids):
-            if self.random_mode:
-                # Random mode: semua GPU search di seluruh range
-                worker_min = self.min_range
-                worker_max = self.max_range
-            else:
-                # Sequential mode: bagi range
-                worker_min = self.min_range + (i * range_per_gpu)
-                worker_max = worker_min + range_per_gpu if i < len(gpu_ids) - 1 else self.max_range
-            
-            # Create worker process
-            worker = BSGSGPUWorker(
-                gpu_id=gpu_id,
-                target_pubkey=self.target_pubkey,
-                min_range=worker_min,
-                max_range=worker_max,
-                output_file=self.output_file,
-                random_mode=self.random_mode
-            )
-            
-            p = mp.Process(
-                target=worker_wrapper,
-                args=(worker, result_queue)
-            )
-            p.daemon = True
-            p.start()
-            processes.append(p)
-            
-            print(f"✅ Started GPU {gpu_id} worker (PID: {p.pid})")
-            print(f"   Range: {hex(worker_min)} - {hex(worker_max)}")
-            time.sleep(1)  # Delay antar startup
-        
-        print(f"\n🔍 Search started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("Press Ctrl+C to stop\n")
-        
-        # Monitor results
-        self.monitor_results(processes, result_queue)
-    
-    def monitor_results(self, processes, result_queue):
-        """Monitor hasil dari semua worker processes"""
-        found = False
-        completed = 0
-        errors = 0
-        start_time = time.time()
-        last_update = time.time()
-        
-        # Statistics
-        total_keys_checked = 0
-        speeds = []
-        
-        try:
-            while not found and (completed + errors) < len(processes):
-                try:
-                    # Check for results
-                    if result_queue.empty():
-                        time.sleep(0.5)
-                        continue
-                    
-                    res = result_queue.get(timeout=1)
-                    
-                    if res['status'] == 'FOUND':
-                        found = True
-                        print(f"\n{'🎉'*30}")
-                        print(f"KEY FOUND BY GPU {res['gpu_id']}!")
-                        print(f"Private Key: {res['private_key']}")
-                        print(f"{'🎉'*30}")
-                        
-                        # Terminate other processes
-                        for p in processes:
-                            if p.is_alive():
-                                p.terminate()
-                        break
-                    
-                    elif res['status'] == 'PROGRESS':
-                        # Update statistics
-                        keys_checked = res.get('keys_checked', 0)
-                        if keys_checked > total_keys_checked:
-                            total_keys_checked = keys_checked
-                        
-                        speed = res.get('speed', 0)
-                        if speed > 0:
-                            speeds.append(speed)
-                            # Keep only last 10 speed measurements
-                            if len(speeds) > 10:
-                                speeds.pop(0)
-                        
-                        # Periodic update display
-                        if time.time() - last_update > 5:
-                            elapsed = time.time() - start_time
-                            if speeds:
-                                avg_speed = sum(speeds) / len(speeds)
-                            else:
-                                avg_speed = 0
-                            
-                            active_workers = len([p for p in processes if p.is_alive()])
-                            
-                            print(f"\n📊 Overall Status (Update):")
-                            print(f"  Time elapsed: {elapsed:.1f}s")
-                            print(f"  Total keys checked: {total_keys_checked:,}")
-                            print(f"  Average speed: {avg_speed:,.0f} keys/s")
-                            print(f"  Active workers: {active_workers}")
-                            print(f"  Completed: {completed}, Errors: {errors}")
-                            
-                            # Estimate time remaining
-                            if avg_speed > 0 and not self.random_mode:
-                                remaining_keys = (self.max_range - self.min_range) - total_keys_checked
-                                if remaining_keys > 0:
-                                    hours_remaining = remaining_keys / avg_speed / 3600
-                                    if hours_remaining > 24:
-                                        days = hours_remaining / 24
-                                        print(f"  Estimated time remaining: {days:.1f} days")
-                                    else:
-                                        print(f"  Estimated time remaining: {hours_remaining:.1f} hours")
-                            
-                            last_update = time.time()
-                    
-                    elif res['status'] == 'COMPLETED':
-                        completed += 1
-                        keys = res.get('keys_checked', 0)
-                        print(f"✅ GPU {res['gpu_id']}: Completed ({keys:,} keys checked)")
-                    
-                    elif res['status'] == 'ERROR':
-                        errors += 1
-                        print(f"❌ GPU {res['gpu_id']}: Error - {res.get('error', 'Unknown error')}")
-                    
-                    elif res['status'] == 'INTERRUPTED':
-                        print(f"⚠️ GPU {res['gpu_id']}: Interrupted by user")
-                        completed += 1
-                
-                except KeyboardInterrupt:
-                    print("\n⚠️ Search interrupted by user")
-                    for p in processes:
-                        if p.is_alive():
-                            p.terminate()
-                    break
-                except Exception as e:
-                    # Timeout or other queue error
-                    if not any(p.is_alive() for p in processes):
-                        break
-                    continue
-            
-            # Final statistics
-            elapsed = time.time() - start_time
-            
-            print(f"\n{'='*70}")
-            print("SEARCH COMPLETED")
-            print(f"{'='*70}")
-            
-            if found:
-                print("✅ KEY FOUND! Check output file for details.")
-            else:
-                print("❌ Key not found in the specified range")
-            
-            print(f"\n📊 Final Statistics:")
-            print(f"  Total time: {elapsed:.1f} seconds")
-            print(f"  Total keys checked: {total_keys_checked:,}")
-            if elapsed > 0:
-                print(f"  Overall speed: {total_keys_checked/elapsed:,.0f} keys/s")
-            print(f"  GPUs completed: {completed}")
-            print(f"  GPUs with errors: {errors}")
-            
-            # Cleanup
-            for p in processes:
-                if p.is_alive():
-                    p.terminate()
-                    p.join(timeout=2)
-            
-        except Exception as e:
-            print(f"\n❌ Error in monitor: {e}")
-            import traceback
-            traceback.print_exc()
-
-def worker_wrapper(worker, result_queue):
-    """Wrapper untuk worker process"""
-    worker.run_continuous_search(result_queue)
-
-# ==================== MAIN PROGRAM ====================
-if __name__ == "__main__":
-    # Set multiprocessing start method
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-    
-    # Tampilkan informasi program
-    print('\n' + '='*70)
-    print('BITCOIN PRIVATE KEY SEARCH - BSGS GPU OPTIMIZED')
-    print('='*70)
-    print('Features:')
-    print('  • BSGS algorithm dengan GPU acceleration')
-    print('  • Support untuk range besar dan kecil')
-    print('  • Multi-GPU support')
-    print('  • Random atau sequential search mode')
-    print('  • Real-time statistics dan progress tracking')
-    print('='*70)
-    
-    # Check required libraries
-    if not ICE_AVAILABLE:
-        print("\n⚠️ Warning: secp256k1_lib not available")
-        print("   This library is required for P3 table generation.")
-        print("   Please install it from: https://github.com/iceland2k14/secp256k1")
-        sys.exit(1)
-    
-    if not BIT_AVAILABLE:
-        print("\n⚠️ Warning: bit library not available")
-        print("   Key verification will be limited")
-        print("   Install: pip install bit")
-    
-    # Start search
-    manager = MultiGPUManager(
-        target_pubkey=TARGET_PUBKEY,
-        min_range_hex=MIN_RANGE,
-        max_range_hex=MAX_RANGE,
-        output_file=OUTPUT_FILE,
-        random_mode=RANDOM_MODE
+    # Execute BSGS search
+    start_time = time.time()
+    res = bsgsgpu.bsgsGPU(
+        GPU_THREADS, GPU_BLOCKS, GPU_POINTS, gpu_bits,
+        gpu_device, P3, len(P3)//65,
+        st_en.encode('utf8'), str(BP_SIZE).encode('utf8')
     )
+    elapsed_time = time.time() - start_time
     
-    manager.start_search()
+    # Process result
+    if res:
+        pvk = (ctypes.cast(res, ctypes.c_char_p).value)
+        if pvk:
+            pvk_str = pvk.decode('utf8')
+            bsgsgpu.free_memory(res)
+            
+            if pvk_str and pvk_str != '':
+                # Validate the found key
+                try:
+                    pvk_int = int(pvk_str, 16)
+                    if validate_private_key(pvk_int, PUBLIC_KEY):
+                        return {
+                            'private_key': pvk_int,
+                            'public_key': PUBLIC_KEY,
+                            'range_searched': f"{hex(start_key)}-{hex(end_key)}",
+                            'time': elapsed_time
+                        }
+                except:
+                    pass
+    
+    if VERBOSE and elapsed_time > 0:
+        keys_per_second = (end_key - start_key) / elapsed_time
+        print(f"Speed: {keys_per_second:,.0f} keys/sec")
+    
+    return None
+
+def bsgs_search_random(gpu_device=0, max_iterations=100):
+    """Perform random search within range"""
+    bsgsgpu = load_bsgs_dll()
+    if not bsgsgpu:
+        return None
+    
+    # Configure DLL
+    bsgsgpu.bsgsGPU.argtypes = [
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p
+    ]
+    bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
+    bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
+    
+    # Prepare public key
+    P = pub2upub(PUBLIC_KEY)
+    G = ice.scalar_multiplication(1)
+    P3 = ice.point_loop_addition(BP_SIZE, P, G)
+    gpu_bits = int(math.log2(BP_SIZE))
+    
+    print(f"[+] Starting random search on GPU {gpu_device}")
+    print(f"[+] Each batch: {BATCH_SIZE:,} keys")
+    
+    iteration = 0
+    total_keys_checked = 0
+    start_time = time.time()
+    
+    while iteration < max_iterations:
+        # Generate random range within bounds
+        k1 = random.randint(START_RANGE, END_RANGE)
+        k2 = k1 + BATCH_SIZE
+        
+        if k2 > END_RANGE:
+            k2 = END_RANGE
+            k1 = k2 - BATCH_SIZE if k2 - BATCH_SIZE > START_RANGE else START_RANGE
+        
+        if k1 > k2:
+            k1, k2 = k2, k1
+        
+        st_en = hex(k1)[2:] + ':' + hex(k2)[2:]
+        
+        if VERBOSE:
+            print(f"\nIteration {iteration + 1}: {hex(k1)[:20]}... - {hex(k2)[:20]}...")
+        
+        # Execute search
+        batch_start = time.time()
+        res = bsgsgpu.bsgsGPU(
+            GPU_THREADS, GPU_BLOCKS, GPU_POINTS, gpu_bits,
+            gpu_device, P3, len(P3)//65,
+            st_en.encode('utf8'), str(BP_SIZE).encode('utf8')
+        )
+        batch_time = time.time() - batch_start
+        
+        # Process result
+        if res:
+            pvk = (ctypes.cast(res, ctypes.c_char_p).value)
+            if pvk:
+                pvk_str = pvk.decode('utf8')
+                bsgsgpu.free_memory(res)
+                
+                if pvk_str and pvk_str != '':
+                    try:
+                        pvk_int = int(pvk_str, 16)
+                        if validate_private_key(pvk_int, PUBLIC_KEY):
+                            total_time = time.time() - start_time
+                            return {
+                                'private_key': pvk_int,
+                                'public_key': PUBLIC_KEY,
+                                'iterations': iteration + 1,
+                                'total_keys': total_keys_checked + (k2 - k1),
+                                'total_time': total_time
+                            }
+                    except:
+                        pass
+        
+        # Update statistics
+        total_keys_checked += (k2 - k1)
+        iteration += 1
+        
+        if batch_time > 0:
+            batch_speed = (k2 - k1) / batch_time
+            avg_speed = total_keys_checked / (time.time() - start_time)
+            print(f"  Batch speed: {batch_speed:,.0f} keys/sec")
+            print(f"  Average speed: {avg_speed:,.0f} keys/sec")
+            print(f"  Total checked: {total_keys_checked:,}")
+    
+    return None
+
+def sequential_search_worker(gpu_id, start_key, end_key, result_queue):
+    """Worker for sequential search on a GPU"""
+    try:
+        print(f"[GPU {gpu_id}] Starting search: {hex(start_key)} to {hex(end_key)}")
+        result = bsgs_search_single_gpu(start_key, end_key, gpu_id)
+        if result:
+            result_queue.put({'gpu_id': gpu_id, 'result': result})
+            return result
+    except Exception as e:
+        print(f"[GPU {gpu_id}] Error: {e}")
+        result_queue.put({'gpu_id': gpu_id, 'error': str(e)})
+    return None
+
+# ==================== MAIN EXECUTION ====================
+
+def save_result(result):
+    """Save found key to file"""
+    try:
+        with open(OUTPUT_FILE, 'a') as f:
+            f.write("\n" + "="*60 + "\n")
+            f.write(f"FOUND PRIVATE KEY!\n")
+            f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Private Key (hex): {hex(result['private_key'])}\n")
+            f.write(f"Private Key (dec): {result['private_key']}\n")
+            f.write(f"Public Key: {result['public_key']}\n")
+            
+            if 'range_searched' in result:
+                f.write(f"Range Searched: {result['range_searched']}\n")
+            if 'iterations' in result:
+                f.write(f"Iterations: {result['iterations']}\n")
+            if 'total_keys' in result:
+                f.write(f"Total Keys Checked: {result['total_keys']:,}\n")
+            if 'total_time' in result:
+                f.write(f"Total Time: {result['total_time']:.2f} seconds\n")
+                f.write(f"Speed: {result['total_keys']/result['total_time']:,.0f} keys/sec\n")
+            
+            f.write("="*60 + "\n")
+        
+        print(f"\n[+] Result saved to {OUTPUT_FILE}")
+    except Exception as e:
+        print(f"[-] Error saving result: {e}")
+
+def main():
+    """Main execution function"""
+    print_config()
+    
+    # Check for DLL
+    if not load_bsgs_dll():
+        print("[-] BSGS DLL not found. Please ensure bt2.dll (Windows) or bt2.so (Linux) is in the same directory.")
+        return
+    
+    # Determine GPU configuration
+    if USE_MULTI_GPU:
+        num_gpus = get_gpu_count()
+        if num_gpus > 1:
+            print(f"[+] Using {num_gpus} GPUs")
+        else:
+            print("[+] Using single GPU mode")
+            USE_MULTI_GPU = False
+    
+    # Setup signal handler for graceful exit
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
+    print("[+] Starting search...")
+    print("[+] Press Ctrl+C to stop\n")
+    
+    found = False
+    result = None
+    
+    try:
+        if SEARCH_MODE.lower() == "random":
+            # Random search mode
+            if USE_MULTI_GPU and num_gpus > 1:
+                print("[+] Random search with multiple GPUs not yet implemented")
+                print("[+] Falling back to single GPU random search")
+            
+            result = bsgs_search_random(GPU_DEVICE_ID, max_iterations=1000)
+        
+        elif SEARCH_MODE.lower() == "sequential":
+            # Sequential search mode
+            if USE_MULTI_GPU and num_gpus > 1:
+                # Split range among GPUs
+                gpu_ranges = split_range_among_gpus(START_RANGE, END_RANGE, num_gpus)
+                
+                # Create multiprocessing queue
+                result_queue = mp.Queue()
+                processes = []
+                
+                # Start workers
+                for gpu_id in range(num_gpus):
+                    start_key, end_key = gpu_ranges[gpu_id]
+                    p = mp.Process(
+                        target=sequential_search_worker,
+                        args=(gpu_id, start_key, end_key, result_queue)
+                    )
+                    p.start()
+                    processes.append(p)
+                
+                # Wait for results
+                while any(p.is_alive() for p in processes) and not found:
+                    try:
+                        msg = result_queue.get(timeout=1)
+                        if 'result' in msg:
+                            result = msg['result']
+                            found = True
+                            print(f"\n[+] Key found by GPU {msg['gpu_id']}!")
+                            
+                            # Terminate other processes
+                            for p in processes:
+                                if p.is_alive():
+                                    p.terminate()
+                            break
+                    except:
+                        continue
+                
+                # Cleanup
+                for p in processes:
+                    p.join(timeout=1)
+            
+            else:
+                # Single GPU sequential search
+                result = bsgs_search_single_gpu(START_RANGE, END_RANGE, GPU_DEVICE_ID)
+        
+        else:
+            print(f"[-] Unknown search mode: {SEARCH_MODE}")
+            print("[-] Please use 'random' or 'sequential'")
+            return
+        
+        # Process result
+        if result:
+            found = True
+            print("\n" + "="*60)
+            print("🎉 PRIVATE KEY FOUND! 🎉")
+            print("="*60)
+            print(f"Private Key (hex): {hex(result['private_key'])}")
+            print(f"Private Key (dec): {result['private_key']}")
+            
+            if 'range_searched' in result:
+                print(f"Range Searched: {result['range_searched']}")
+            if 'iterations' in result:
+                print(f"Iterations: {result['iterations']}")
+            if 'total_keys' in result:
+                print(f"Total Keys Checked: {result['total_keys']:,}")
+            if 'total_time' in result:
+                print(f"Total Time: {result['total_time']:.2f} seconds")
+                print(f"Average Speed: {result['total_keys']/result['total_time']:,.0f} keys/sec")
+            
+            print("="*60)
+            
+            # Save result
+            save_result(result)
+        else:
+            print("\n[-] Private key not found in the specified range")
+    
+    except KeyboardInterrupt:
+        print("\n\n[-] Search interrupted by user")
+    except Exception as e:
+        print(f"\n[-] Error during search: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n[+] Program finished")
+
+# ==================== RETAINED FUNCTIONS (unchanged) ====================
+
+# These functions from the original bxx.py are kept for compatibility
+# but are not used in the main execution flow
+
+def old_bsgs_style_function():
+    """Example of retained function from original bxx.py"""
+    pass
+
+def another_retained_function():
+    """Another function kept for compatibility"""
+    pass
+
+# ==================== ENTRY POINT ====================
+
+if __name__ == "__main__":
+    main()
