@@ -27,12 +27,12 @@ import multiprocessing as mp
 # ==================== CONFIGURATION ====================
 # Edit these variables for your search
 
-PUBLIC_KEY = "02CEB6CBBCDBDF5EF7150682150F4CE2C6F4807B349827DCDBDD1F2EFA885A2630"
-START_RANGE_HEX = "800000000000000000000000000000"
-END_RANGE_HEX = "ffffffffffffffffffffffffffffff"
+PUBLIC_KEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"
+START_RANGE_HEX = "80000"
+END_RANGE_HEX = "fffff"
 
 # Search mode: "random" or "sequential"
-SEARCH_MODE = "random"
+SEARCH_MODE = "sequential"
 
 # GPU Configuration
 USE_MULTI_GPU = True  # Set to False for single GPU
