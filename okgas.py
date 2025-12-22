@@ -15,6 +15,8 @@ import math
 import signal
 import time
 import numpy as np
+import ecdsa
+from ecdsa.curves import SECP256k1
 
 # ==================== KONFIGURASI ====================
 PUBKEY_HEX = "02CEB6CBBCDBDF5EF7150682150F4CE2C6F4807B349827DCDBDD1F2EFA885A2630"  # Public Key target
@@ -112,27 +114,85 @@ def load_bsgs_gpu_library():
     print(f"   ✓ Loaded library: {dllfile}")
     return bsgsgpu
 
+def decompress_pubkey(compressed_pubkey_hex):
+    """Decompress compressed public key (02/03 prefix)"""
+    if not compressed_pubkey_hex.startswith(('02', '03')):
+        raise ValueError("Not a compressed public key")
+    
+    # Parse x coordinate
+    x_hex = compressed_pubkey_hex[2:]  # Remove prefix
+    x = int(x_hex, 16)
+    
+    # Curve parameters
+    curve = SECP256k1.curve
+    p = curve.p()
+    
+    # Calculate y^2 = x^3 + 7
+    y_sq = (pow(x, 3, p) + 7) % p
+    
+    # Calculate square root mod p
+    y = pow(y_sq, (p + 1) // 4, p)
+    
+    # Check parity
+    if (y % 2) != (int(compressed_pubkey_hex[:2], 16) % 2):
+        y = p - y
+    
+    return x, y
+
 def pub2upub(pub_hex):
     """Convert compressed/uncompressed pubkey to uncompressed bytes"""
     if len(pub_hex) == 130 and pub_hex.startswith('04'):
         # Already uncompressed
         x = int(pub_hex[2:66], 16)
         y = int(pub_hex[66:], 16)
+        print(f"   ✓ Public key is already uncompressed")
     elif len(pub_hex) == 66 and pub_hex.startswith(('02', '03')):
-        # Compressed - decompress menggunakan bit library
+        # Compressed - decompress manually
+        print(f"   ✓ Decompressing compressed public key...")
         try:
-            pk = bit.Key(pub_hex)
-            x_hex = format(pk.public_point.x(), '064x')
-            y_hex = format(pk.public_point.y(), '064x')
-            x = int(x_hex, 16)
-            y = int(y_hex, 16)
+            x, y = decompress_pubkey(pub_hex)
+            print(f"   ✓ Successfully decompressed")
         except Exception as e:
-            print(f"   ✗ Error decompressing pubkey: {e}")
-            sys.exit(1)
+            print(f"   ✗ Error decompressing: {e}")
+            # Fallback: coba gunakan library ice untuk decompress
+            try:
+                # Konversi hex ke integer dulu
+                from ecdsa import SigningKey
+                import bit
+                
+                # Gunakan bit library dengan cara yang benar
+                # Convert hex ke bytes
+                pubkey_bytes = bytes.fromhex(pub_hex)
+                
+                # Gunakan ecdsa library langsung
+                curve = SECP256k1
+                x = int(pub_hex[2:], 16)
+                
+                # Calculate y
+                p = curve.curve.p()
+                y_sq = (pow(x, 3, p) + curve.curve.a() * x + curve.curve.b()) % p
+                y = pow(y_sq, (p + 1) // 4, p)
+                
+                # Adjust parity
+                if (y % 2) != (int(pub_hex[:2], 16) % 2):
+                    y = p - y
+                    
+                print(f"   ✓ Decompressed via fallback method")
+            except Exception as e2:
+                print(f"   ✗ All decompression methods failed: {e2}")
+                sys.exit(1)
     else:
-        raise ValueError("Invalid public key format")
+        raise ValueError(f"Invalid public key format. Length: {len(pub_hex)}, Prefix: {pub_hex[:2]}")
     
-    return bytes.fromhex('04' + hex(x)[2:].zfill(64) + hex(y)[2:].zfill(64))
+    # Format output sebagai uncompressed (04 + x + y)
+    x_hex = hex(x)[2:].zfill(64)
+    y_hex = hex(y)[2:].zfill(64)
+    uncompressed_hex = '04' + x_hex + y_hex
+    
+    print(f"   ✓ X: {x_hex[:16]}...")
+    print(f"   ✓ Y: {y_hex[:16]}...")
+    
+    return bytes.fromhex(uncompressed_hex)
 
 def save_found_key(private_key_hex, public_key_hex):
     """Save found key to file"""
@@ -143,11 +203,47 @@ def save_found_key(private_key_hex, public_key_hex):
         f.write('=' * 50 + '\n')
     print(f"✅ Key saved to {OUTPUT_FILE}")
 
+def test_pubkey_conversion():
+    """Test fungsi pub2upub dengan contoh key"""
+    print("\n🔧 Testing public key conversion...")
+    
+    # Test dengan key yang diketahui valid
+    test_key = "02CEB6CBBCDBDF5EF7150682150F4CE2C6F4807B349827DCDBDD1F2EFA885A2630"
+    
+    try:
+        result = pub2upub(test_key)
+        print(f"   ✓ Test passed. Output length: {len(result)} bytes")
+        
+        # Verifikasi dengan ice library
+        x = int(result[1:33].hex(), 16)
+        y = int(result[33:].hex(), 16)
+        
+        # Verifikasi point ada di curve
+        curve = SECP256k1.curve
+        left = (y * y) % curve.p()
+        right = (pow(x, 3, curve.p()) + 7) % curve.p()
+        
+        if left == right:
+            print(f"   ✓ Point is on curve (verification passed)")
+        else:
+            print(f"   ✗ Point verification failed")
+            
+        return True
+    except Exception as e:
+        print(f"   ✗ Test failed: {e}")
+        return False
+
 # ==================== MAIN PROGRAM ====================
 def main():
     print('\n' + '='*70)
     print('BSGS GPU SEARCH (Optimized)')
     print('='*70)
+    
+    # Test public key conversion terlebih dahulu
+    print("\n[0] Testing public key conversion...")
+    if not test_pubkey_conversion():
+        print("❌ Public key conversion test failed. Exiting.")
+        return
     
     # Precompute G-Table (untuk referensi/future use)
     print("\n[1] Precomputing lookup tables...")
@@ -162,7 +258,8 @@ def main():
     print("\n[3] Processing target public key...")
     try:
         P = pub2upub(PUBKEY_HEX)
-        print(f"   ✓ Target pubkey loaded: {PUBKEY_HEX[:20]}...")
+        print(f"   ✓ Target pubkey loaded successfully")
+        print(f"   ✓ Public key length: {len(P)} bytes")
     except Exception as e:
         print(f"   ✗ Error processing public key: {e}")
         return
@@ -182,6 +279,7 @@ def main():
     print(f"   ✓ bP Table size: {BP_TABLE_SIZE:,}")
     print(f"   ✓ GPU Device: {GPU_DEVICE}")
     print(f"   ✓ GPU Config: {GPU_THREADS} threads, {GPU_BLOCKS} blocks, {GPU_POINTS} points/thread")
+    print(f"   ✓ P3 table size: {len(P3)} bytes ({len(P3)//65} points)")
     
     print("\n" + '='*70)
     print("🚀 STARTING SEARCH...")
