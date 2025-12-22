@@ -19,9 +19,9 @@ import ecdsa
 from ecdsa.curves import SECP256k1
 
 # ==================== KONFIGURASI ====================
-PUBKEY_HEX = "02CEB6CBBCDBDF5EF7150682150F4CE2C6F4807B349827DCDBDD1F2EFA885A2630"  # Public Key target
-SEARCH_RANGE_START = 0x800000000000000000000000000000  # Start range (hex)
-SEARCH_RANGE_END = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF    # End range (hex)
+PUBKEY_HEX = "02f6a8148a62320e149cb15c544fe8a25ab483a0095d2280d03b8a00a7feada13d"  # Public Key target
+SEARCH_RANGE_START = 0x400000000  # Start range (hex)
+SEARCH_RANGE_END = 0x7ffffffff    # End range (hex)
 SEARCH_ATTEMPTS = 100000000000000000                    # Total search attempts in 1 loop
 GPU_DEVICE = 0                                          # GPU Device ID
 GPU_THREADS = 64                                        # GPU Threads
