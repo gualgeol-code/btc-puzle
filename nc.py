@@ -1,73 +1,72 @@
 # -*- coding: utf-8 -*-
 """
-Direct Search BTC Puzzle
+SIMPLE BITCOIN PRIVATE KEY FINDER
 """
 
 import secp256k1_lib as ice
-import bit
 import time
 
+# Target public key
 TARGET_PUBKEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"
-START_KEY = 0x80000
-END_KEY = 0xfffff
 
-def pubkey_to_uncompressed(pub_hex):
-    """Konversi public key ke uncompressed"""
-    if pub_hex.startswith('04'):
-        return bytes.fromhex(pub_hex)
-    
-    x = int(pub_hex[2:66], 16)
-    prefix = int(pub_hex[:2], 16)
-    y_parity = prefix % 2
-    y = bit.format.x_to_y(x, y_parity)
-    
-    return bytes.fromhex('04' + format(x, '064x') + format(y, '064x'))
+# Search range
+START = 0x80000   # 524,288
+END = 0xFFFFF     # 1,048,575
 
 def main():
-    print(f"Target: {TARGET_PUBKEY}")
-    print(f"Range: {hex(START_KEY)} - {hex(END_KEY)}")
-    print(f"Total keys: {END_KEY - START_KEY + 1:,}\n")
+    print(f"Searching for private key of: {TARGET_PUBKEY[:20]}...")
+    print(f"Range: {hex(START)} to {hex(END)}")
+    print(f"Total keys: {END - START + 1:,}")
+    print("-" * 50)
     
-    target_pubkey_bytes = pubkey_to_uncompressed(TARGET_PUBKEY)
+    # Convert target to uncompressed
+    def convert_pubkey(pubkey_hex):
+        if pubkey_hex.startswith('02') or pubkey_hex.startswith('03'):
+            x = int(pubkey_hex[2:], 16)
+            p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+            y_sq = (pow(x, 3, p) + 7) % p
+            y = pow(y_sq, (p + 1) // 4, p)
+            
+            if (pubkey_hex.startswith('02') and y % 2 == 1) or (pubkey_hex.startswith('03') and y % 2 == 0):
+                y = p - y
+            
+            return bytes.fromhex('04' + format(x, '064x') + format(y, '064x'))
+        return bytes.fromhex(pubkey_hex)
+    
+    target = convert_pubkey(TARGET_PUBKEY)
+    print("Starting search...\n")
     
     start_time = time.time()
-    keys_checked = 0
-    last_print = start_time
     
-    print(f"[{time.strftime('%H:%M:%S')}] Memulai pencarian...")
-    
-    for private_key in range(START_KEY, END_KEY + 1):
-        # Hitung public key dari private key
-        pubkey_bytes = ice.scalar_multiplication(private_key)
+    for k in range(START, END + 1):
+        # Calculate public key
+        pub = ice.scalar_multiplication(k)
         
-        # Bandingkan dengan target
-        if pubkey_bytes == target_pubkey_bytes:
-            print(f"\n{'='*60}")
-            print("SUCCESS! KEY FOUND!")
-            print(f"{'='*60}")
-            print(f"Private Key: {hex(private_key)}")
-            print(f"Private Key (decimal): {private_key}")
-            print(f"Public Key: {TARGET_PUBKEY}")
-            print(f"{'='*60}")
+        # Check if matches target
+        if pub == target:
+            elapsed = time.time() - start_time
+            print("\n" + "="*50)
+            print(f"✅ FOUND! Private Key: 0x{k:x}")
+            print(f"Time: {elapsed:.2f} seconds")
+            print("="*50)
             
-            with open("found_direct.txt", "w") as f:
-                f.write(f"Private Key: {hex(private_key)}\n")
+            # Save result
+            with open("key_found.txt", "w") as f:
+                f.write(f"Private Key: 0x{k:x}\n")
                 f.write(f"Public Key: {TARGET_PUBKEY}\n")
+                f.write(f"Found in: {elapsed:.2f}s\n")
             
-            return
+            return k
         
-        keys_checked += 1
-        
-        # Print progress setiap 10 detik
-        current_time = time.time()
-        if current_time - last_print >= 10:
-            elapsed = current_time - start_time
-            speed = keys_checked / elapsed if elapsed > 0 else 0
-            print(f"[{time.strftime('%H:%M:%S')}] Progress: {keys_checked:,} keys, "
-                  f"Speed: {speed:,.0f} keys/sec")
-            last_print = current_time
+        # Show progress
+        if (k - START) % 50000 == 0 and k > START:
+            elapsed = time.time() - start_time
+            progress = (k - START + 1) / (END - START + 1) * 100
+            speed = (k - START + 1) / elapsed
+            print(f"Progress: {progress:.1f}% - Speed: {speed:,.0f} keys/sec")
     
-    print(f"\n[-] Key tidak ditemukan dalam range")
+    print("\n❌ Key not found in range.")
+    return None
 
 if __name__ == "__main__":
     main()
