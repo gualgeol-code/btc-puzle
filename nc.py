@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BSGS GPU Tool - Fixed Version with CPU Fallback
+BSGS GPU Tool - Fixed GPU Version
 """
 
 import secp256k1_lib as ice
@@ -13,12 +13,10 @@ import random
 import math
 import signal
 import time
-import hashlib
-import threading
-from queue import Queue
+import struct
 
 # ==============================================================================
-# KONFIGURASI PARAMETER
+# KONFIGURASI PARAMETER UNTUK GPU
 # ==============================================================================
 
 # Public Key target
@@ -28,21 +26,12 @@ PUBLIC_KEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c
 KEYSPACE_MIN = 0x80000      # 524,288
 KEYSPACE_MAX = 0xFFFFF      # 1,048,575
 
-# Private key yang SEBENARNYA (untuk verifikasi saja, HAPUS setelah testing!)
-# Ganti dengan private key yang sesuai dengan PUBLIC_KEY di atas
-KNOWN_PRIVATE_KEY = 0xd2c55  # Contoh: 703,710
-
-# Konfigurasi GPU (di-disable sementara karena error)
-USE_GPU = False  # Set ke False untuk menggunakan CPU brute force
+# Konfigurasi GPU - OPTIMAL UNTUK TESLA T4
 GPU_DEVICE = 0
-GPU_THREADS = 32
-GPU_BLOCKS = 8
-GPU_POINTS = 128
-BP_SIZE = 65536
-
-# Konfigurasi CPU
-CPU_THREADS = 8  # Jumlah thread untuk CPU brute force
-BATCH_SIZE = 1000  # Ukuran batch per thread
+GPU_THREADS = 256          # Optimal untuk T4
+GPU_BLOCKS = 128           # Optimal untuk T4
+GPU_POINTS = 256           # Points per thread
+BP_SIZE = 500000           # bP table elements
 
 # Output file
 OUTPUT_FILE = "found_keys.txt"
@@ -53,24 +42,20 @@ OUTPUT_FILE = "found_keys.txt"
 
 def pub2upub(pub_hex):
     """Convert compressed/uncompressed public key to uncompressed format"""
-    # Pastikan panjang hex genap
     pub_hex = pub_hex.strip()
     
     if pub_hex.startswith('02') or pub_hex.startswith('03'):
         # Compressed format
         x = int(pub_hex[2:], 16)
+        
         # Hitung y dari x menggunakan kurva secp256k1: y² = x³ + 7
         p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-        a = 0
-        b = 7
+        y_sq = (pow(x, 3, p) + 7) % p
         
-        # Hitung y² = x³ + ax + b mod p
-        y_sq = (pow(x, 3, p) + a * x + b) % p
-        
-        # Hitung y = sqrt(y²) mod p (p ≡ 3 mod 4, so use Euler's criterion)
+        # Hitung y = sqrt(y²) mod p
         y = pow(y_sq, (p + 1) // 4, p)
         
-        # Sesuaikan dengan prefix (02 untuk y genap, 03 untuk y ganjil)
+        # Sesuaikan dengan prefix
         if (pub_hex.startswith('02') and y % 2 == 1) or (pub_hex.startswith('03') and y % 2 == 0):
             y = p - y
         
@@ -80,380 +65,302 @@ def pub2upub(pub_hex):
         # Uncompressed format
         if len(pub_hex) == 130:
             return bytes.fromhex(pub_hex)
-        elif len(pub_hex) == 128:
-            return bytes.fromhex('04' + pub_hex)
         else:
-            # Pad if necessary
             return bytes.fromhex('04' + pub_hex[2:].zfill(128))
     
-    # Jika tanpa prefix, asumsi compressed
     else:
-        x = int(pub_hex, 16)
-        p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-        y_sq = (pow(x, 3, p) + 7) % p
-        y = pow(y_sq, (p + 1) // 4, p)
-        # Default to even y
-        if y % 2 == 1:
-            y = p - y
-        return bytes.fromhex('04' + format(x, '064x') + format(y, '064x'))
+        # Assume uncompressed without prefix
+        return bytes.fromhex('04' + pub_hex.zfill(128))
 
-def verify_key_pair(private_key_hex, target_pubkey_hex):
+def verify_key(private_key_hex, target_pubkey_hex):
     """Verifikasi bahwa private key menghasilkan public key yang sesuai"""
     try:
         priv_int = int(private_key_hex, 16)
-        
-        # Hitung public key dari private key
         computed_pub = ice.scalar_multiplication(priv_int)
-        
-        # Konversi target ke uncompressed
         target_pub = pub2upub(target_pubkey_hex)
-        
-        # Bandingkan
         return computed_pub == target_pub
-    except Exception as e:
-        print(f"Verification error: {e}")
+    except:
         return False
 
-def generate_test_keypair():
-    """Generate test keypair untuk debugging"""
-    test_priv = random.randint(KEYSPACE_MIN, KEYSPACE_MAX)
-    test_pub = ice.scalar_multiplication(test_priv)
-    
-    # Konversi ke compressed format
-    x = int(test_pub[1:33].hex(), 16)
-    y = int(test_pub[33:].hex(), 16)
-    prefix = '02' if y % 2 == 0 else '03'
-    
-    compressed_pub = prefix + format(x, '064x')
-    
-    return test_priv, compressed_pub
-
 # ==============================================================================
-# CPU BRUTE FORCE IMPLEMENTATION
+# INISIALISASI GPU LIBRARY
 # ==============================================================================
 
-def cpu_worker(start, end, target_pub, result_queue, thread_id):
-    """Worker thread untuk CPU brute force"""
-    try:
-        print(f"[Thread {thread_id}] Starting from {hex(start)} to {hex(end)}")
-        
-        # Konversi target pubkey ke bytes sekali saja
-        target_bytes = pub2upub(target_pub)
-        
-        batch_count = 0
-        start_time = time.time()
-        
-        for k in range(start, end + 1):
-            # Hitung public key
-            pub = ice.scalar_multiplication(k)
-            
-            # Bandingkan dengan target
-            if pub == target_bytes:
-                elapsed = time.time() - start_time
-                speed = (k - start + 1) / elapsed if elapsed > 0 else 0
-                
-                result_queue.put({
-                    'found': True,
-                    'private_key': k,
-                    'thread_id': thread_id,
-                    'keys_checked': k - start + 1,
-                    'time': elapsed,
-                    'speed': speed
-                })
-                return
-            
-            # Progress reporting
-            batch_count += 1
-            if batch_count >= 10000:
-                elapsed = time.time() - start_time
-                speed = (k - start + 1) / elapsed if elapsed > 0 else 0
-                progress = (k - start + 1) / (end - start + 1) * 100
-                
-                print(f"[Thread {thread_id}] Progress: {progress:.1f}%, Speed: {speed:,.0f} keys/sec", end='\r')
-                batch_count = 0
-        
-        # Jika tidak ditemukan
-        elapsed = time.time() - start_time
-        keys_checked = end - start + 1
-        speed = keys_checked / elapsed if elapsed > 0 else 0
-        
-        result_queue.put({
-            'found': False,
-            'thread_id': thread_id,
-            'keys_checked': keys_checked,
-            'time': elapsed,
-            'speed': speed
-        })
-        
-    except Exception as e:
-        print(f"[Thread {thread_id}] Error: {e}")
-        result_queue.put({
-            'found': False,
-            'thread_id': thread_id,
-            'error': str(e)
-        })
-
-def cpu_bruteforce_range(start_range, end_range, target_pubkey, num_threads=4):
-    """Brute force range menggunakan multiple CPU threads"""
-    print(f"\n[CPU] Starting brute force from {hex(start_range)} to {hex(end_range)}")
-    print(f"[CPU] Total keys: {end_range - start_range + 1:,}")
-    print(f"[CPU] Using {num_threads} threads")
+def initialize_gpu_library():
+    """Initialize GPU library dengan error handling"""
+    print("[+] Initializing GPU library...")
     
-    total_keys = end_range - start_range + 1
-    keys_per_thread = total_keys // num_threads
-    
-    result_queue = Queue()
-    threads = []
-    
-    # Create threads
-    for i in range(num_threads):
-        thread_start = start_range + i * keys_per_thread
-        thread_end = thread_start + keys_per_thread - 1
-        
-        # Untuk thread terakhir, pastikan mencakup sisa keys
-        if i == num_threads - 1:
-            thread_end = end_range
-        
-        thread = threading.Thread(
-            target=cpu_worker,
-            args=(thread_start, thread_end, target_pubkey, result_queue, i)
-        )
-        threads.append(thread)
-    
-    # Start all threads
-    start_time = time.time()
-    for thread in threads:
-        thread.start()
-    
-    # Monitor results
-    total_checked = 0
-    completed_threads = 0
-    found_key = None
-    
-    while completed_threads < num_threads and found_key is None:
-        try:
-            result = result_queue.get(timeout=1)
-            completed_threads += 1
-            
-            if result.get('found', False):
-                found_key = result['private_key']
-                print(f"\n[CPU] Thread {result['thread_id']} found key: {hex(found_key)}")
-                print(f"[CPU] Checked {result['keys_checked']:,} keys in {result['time']:.2f}s")
-                print(f"[CPU] Speed: {result['speed']:,.0f} keys/sec")
-                
-                # Stop other threads
-                for thread in threads:
-                    if thread.is_alive():
-                        thread.join(timeout=0.1)
-                break
-            else:
-                total_checked += result['keys_checked']
-                print(f"[CPU] Thread {result['thread_id']} completed: {result['keys_checked']:,} keys")
-        
-        except Exception as e:
-            # Timeout, check if threads are still alive
-            alive_threads = sum(1 for t in threads if t.is_alive())
-            if alive_threads == 0:
-                break
-    
-    # Wait for all threads to finish
-    for thread in threads:
-        thread.join(timeout=1)
-    
-    total_time = time.time() - start_time
-    
-    if found_key is not None:
-        return found_key, total_time, total_checked
+    if platform.system().lower().startswith('win'):
+        lib_files = ['bt2.dll', 'bsgs.dll', 'gpu_search.dll']
+    elif platform.system().lower().startswith('lin'):
+        lib_files = ['bt2.so', 'bsgs.so', 'libbt2.so', 'libbsgs.so']
     else:
-        # Count any remaining keys
-        while not result_queue.empty():
-            result = result_queue.get_nowait()
-            if result.get('found', False):
-                found_key = result['private_key']
-                return found_key, total_time, total_checked
-            total_checked += result.get('keys_checked', 0)
-        
-        return None, total_time, total_checked
-
-# ==============================================================================
-# GPU IMPLEMENTATION (Optional)
-# ==============================================================================
-
-def initialize_gpu():
-    """Initialize GPU library if available"""
-    if not USE_GPU:
+        print("[-] Unsupported platform")
         return None
     
-    try:
-        if platform.system().lower().startswith('win'):
-            dllfile = 'bt2.dll'
-        elif platform.system().lower().startswith('lin'):
-            dllfile = 'bt2.so'
-        else:
-            return None
-        
-        if os.path.isfile(dllfile):
-            bsgsgpu = ctypes.CDLL(os.path.realpath(dllfile))
-            
-            # Setup function prototypes
-            bsgsgpu.bsgsGPU.argtypes = [
-                ctypes.c_uint32,  # threads
-                ctypes.c_uint32,  # blocks
-                ctypes.c_uint32,  # points
-                ctypes.c_uint32,  # bits
-                ctypes.c_int,     # device
-                ctypes.c_char_p,  # upubs
-                ctypes.c_uint32,  # size
-                ctypes.c_char_p,  # keyspace
-                ctypes.c_char_p   # bp size
-            ]
-            bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
-            bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
-            
-            return bsgsgpu
-    except Exception as e:
-        print(f"[GPU] Initialization failed: {e}")
+    # Cari file library
+    for lib_file in lib_files:
+        if os.path.exists(lib_file):
+            try:
+                print(f"[+] Found library: {lib_file}")
+                bsgsgpu = ctypes.CDLL(os.path.realpath(lib_file))
+                
+                # Coba setup function prototypes
+                try:
+                    bsgsgpu.bsgsGPU.argtypes = [
+                        ctypes.c_uint32,  # threads
+                        ctypes.c_uint32,  # blocks  
+                        ctypes.c_uint32,  # points
+                        ctypes.c_uint32,  # bits
+                        ctypes.c_int,     # device
+                        ctypes.c_char_p,  # upubs
+                        ctypes.c_uint32,  # size
+                        ctypes.c_char_p,  # keyspace
+                        ctypes.c_char_p   # bp size
+                    ]
+                    bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
+                    bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
+                    
+                    print("[+] GPU library initialized successfully")
+                    return bsgsgpu
+                except Exception as e:
+                    print(f"[-] Error setting up function prototypes: {e}")
+                    continue
+                    
+            except Exception as e:
+                print(f"[-] Failed to load {lib_file}: {e}")
+                continue
     
+    print("[-] No valid GPU library found")
     return None
 
 # ==============================================================================
-# MAIN PROGRAM
+# PREPARE DATA UNTUK GPU
+# ==============================================================================
+
+def prepare_gpu_data(target_pubkey):
+    """Siapkan data yang diperlukan untuk GPU"""
+    print("[+] Preparing data for GPU...")
+    
+    try:
+        # Convert public key
+        P = pub2upub(target_pubkey)
+        if P is None or len(P) != 65:
+            print("[-] Invalid public key format")
+            return None, None
+        
+        print(f"[+] Public key converted (65 bytes)")
+        
+        # Generate base point G
+        G = ice.scalar_multiplication(1)
+        if G is None or len(G) != 65:
+            print("[-] Failed to generate base point")
+            return None, None
+        
+        print(f"[+] Base point generated")
+        
+        # Generate P3 table = P + i*G for i=0..BP_SIZE-1
+        print(f"[+] Generating P3 table ({BP_SIZE} points)...")
+        P3 = ice.point_loop_addition(BP_SIZE, P, G)
+        
+        if P3 is None or len(P3) != BP_SIZE * 65:
+            print(f"[-] P3 table generation failed. Expected {BP_SIZE*65} bytes, got {len(P3) if P3 else 0}")
+            return None, None
+        
+        print(f"[+] P3 table generated: {len(P3):,} bytes")
+        print(f"[+] P3 table points: {len(P3)//65:,}")
+        
+        return P, P3
+        
+    except Exception as e:
+        print(f"[-] Error preparing GPU data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+# ==============================================================================
+# GPU SEARCH FUNCTION
+# ==============================================================================
+
+def gpu_search_range(bsgsgpu, P3, start_key, end_key):
+    """Search range menggunakan GPU"""
+    if start_key > end_key:
+        start_key, end_key = end_key, start_key
+    
+    # Format keyspace string (tanpa 0x)
+    keyspace_str = f"{start_key:x}:{end_key:x}"
+    
+    print(f"[GPU] Searching range: {hex(start_key)} to {hex(end_key)}")
+    print(f"[GPU] Keyspace string: {keyspace_str}")
+    
+    # Hitung bits untuk bloom filter
+    gpu_bits = int(math.log2(BP_SIZE)) if BP_SIZE > 0 else 19
+    
+    start_time = time.time()
+    
+    try:
+        # Panggil fungsi GPU
+        res = bsgsgpu.bsgsGPU(
+            GPU_THREADS,
+            GPU_BLOCKS,
+            GPU_POINTS,
+            gpu_bits,
+            GPU_DEVICE,
+            P3,
+            len(P3) // 65,
+            keyspace_str.encode('utf8'),
+            str(BP_SIZE).encode('utf8')
+        )
+        
+        elapsed = time.time() - start_time
+        
+        if res:
+            # Decode result
+            pvk_ptr = ctypes.cast(res, ctypes.c_char_p)
+            if pvk_ptr.value:
+                pvk = pvk_ptr.value.decode('utf8').strip()
+            else:
+                pvk = ""
+            bsgsgpu.free_memory(res)
+            
+            return pvk, elapsed
+        else:
+            return "", elapsed
+            
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[GPU] Error during search: {e}")
+        return None, elapsed
+
+# ==============================================================================
+# MAIN SEARCH FUNCTION
 # ==============================================================================
 
 def main():
     print('\n' + '='*70)
-    print('BITCOIN PRIVATE KEY SEARCH TOOL')
+    print('BSGS GPU SEARCH TOOL - FIXED VERSION')
     print('='*70)
     
-    # Konversi keyspace
+    # Load GPU library
+    bsgsgpu = initialize_gpu_library()
+    if bsgsgpu is None:
+        print("[-] Cannot continue without GPU library")
+        return
+    
+    # Prepare GPU data
+    P, P3 = prepare_gpu_data(PUBLIC_KEY)
+    if P is None or P3 is None:
+        print("[-] Failed to prepare GPU data")
+        return
+    
+    # Set keyspace
     a, b = KEYSPACE_MIN, KEYSPACE_MAX
     if a > b:
         a, b = b, a
     
     total_keys = b - a + 1
     
-    # Display configuration
-    print(f"[+] Target Public Key: {PUBLIC_KEY}")
-    print(f"[+] Search Range: {hex(a)} - {hex(b)}")
-    print(f"[+] Total Keys: {total_keys:,}")
-    print(f"[+] Expected Bit Length: {int(math.log2(total_keys)) + 1} bits")
-    
-    # Verify public key format
-    try:
-        target_pub_bytes = pub2upub(PUBLIC_KEY)
-        print(f"[+] Public key decoded successfully")
-        print(f"[+] Public key (uncompressed): {target_pub_bytes.hex()[:20]}...")
-    except Exception as e:
-        print(f"[-] Error decoding public key: {e}")
-        return
-    
-    # OPTIONAL: Generate test keypair for verification
-    print("\n[DEBUG] Generating test keypair for verification...")
-    test_priv, test_pub = generate_test_keypair()
-    print(f"[DEBUG] Test Private Key: {hex(test_priv)}")
-    print(f"[DEBUG] Test Public Key: {test_pub}")
-    
-    # Verify our conversion works
-    test_pub_bytes = pub2upub(test_pub)
-    computed_from_test = ice.scalar_multiplication(test_priv)
-    if test_pub_bytes == computed_from_test:
-        print("[DEBUG] ✓ Keypair verification PASSED")
-    else:
-        print("[DEBUG] ✗ Keypair verification FAILED")
-        print(f"[DEBUG] Expected: {test_pub_bytes.hex()[:50]}...")
-        print(f"[DEBUG] Got: {computed_from_test.hex()[:50]}...")
-    
-    # Ask user for mode selection
-    print("\n" + "="*70)
-    print("SELECT SEARCH METHOD:")
-    print("1. CPU Brute Force (Recommended for small ranges)")
-    print("2. GPU BSGS (Experimental, may fail)")
-    print("3. Hybrid (CPU first, then GPU)")
-    print("="*70)
-    
-    choice = input("Enter choice (1-3): ").strip()
-    
-    found_key = None
-    search_time = 0
-    keys_checked = 0
-    
-    # OPTION 1: CPU Brute Force
-    if choice == "1":
-        print("\n[+] Starting CPU Brute Force...")
-        
-        # Determine optimal thread count
-        num_threads = min(CPU_THREADS, os.cpu_count() or 4)
-        print(f"[+] Using {num_threads} CPU threads")
-        
-        # Start brute force
-        found_key, search_time, keys_checked = cpu_bruteforce_range(
-            a, b, PUBLIC_KEY, num_threads
-        )
-    
-    # OPTION 2: GPU BSGS
-    elif choice == "2":
-        print("\n[+] Attempting GPU BSGS search...")
-        
-        # Initialize GPU
-        bsgsgpu = initialize_gpu()
-        if bsgsgpu:
-            print("[GPU] Library loaded successfully")
-            # GPU search implementation would go here
-            # (Currently disabled due to library issues)
-            print("[GPU] Search functionality temporarily disabled")
-            print("[GPU] Falling back to CPU brute force...")
-            
-            # Fallback to CPU
-            found_key, search_time, keys_checked = cpu_bruteforce_range(
-                a, b, PUBLIC_KEY, min(4, os.cpu_count() or 2)
-            )
-        else:
-            print("[-] GPU library not found or failed to load")
-            print("[+] Falling back to CPU brute force...")
-            
-            found_key, search_time, keys_checked = cpu_bruteforce_range(
-                a, b, PUBLIC_KEY, min(4, os.cpu_count() or 2)
-            )
-    
-    # OPTION 3: Hybrid
-    elif choice == "3":
-        print("\n[+] Starting Hybrid Search...")
-        
-        # First try CPU for quick results
-        print("[Phase 1] Quick CPU scan...")
-        found_key, search_time, keys_checked = cpu_bruteforce_range(
-            a, min(a + 100000, b), PUBLIC_KEY, 2
-        )
-        
-        # If not found, try GPU if available
-        if not found_key and USE_GPU:
-            print("\n[Phase 2] GPU BSGS search...")
-            # GPU implementation would go here
-            print("[GPU] Not implemented in this version")
-    
-    else:
-        print("[-] Invalid choice. Defaulting to CPU Brute Force...")
-        found_key, search_time, keys_checked = cpu_bruteforce_range(
-            a, b, PUBLIC_KEY, min(4, os.cpu_count() or 2)
-        )
-    
-    # ==========================================================================
-    # RESULTS
-    # ==========================================================================
-    
-    print('\n' + '='*70)
-    print('SEARCH RESULTS')
+    print(f"\n[+] Search Configuration:")
+    print(f"    Target Public Key: {PUBLIC_KEY[:20]}...{PUBLIC_KEY[-20:]}")
+    print(f"    Keyspace Range: {hex(a)} - {hex(b)}")
+    print(f"    Total Keys: {total_keys:,}")
+    print(f"    GPU Threads: {GPU_THREADS}")
+    print(f"    GPU Blocks: {GPU_BLOCKS}")
+    print(f"    Points/Thread: {GPU_POINTS}")
+    print(f"    BP Size: {BP_SIZE}")
     print('='*70)
     
-    if found_key is not None:
-        # Verify the found key
-        is_valid = verify_key_pair(hex(found_key), PUBLIC_KEY)
+    # Mulai pencarian
+    print("\n[+] Starting GPU search... (Press Ctrl+C to stop)\n")
+    
+    search_count = 0
+    keys_searched = 0
+    found_key = None
+    start_total_time = time.time()
+    
+    try:
+        # Mode sequential untuk range kecil
+        current = a
+        chunk_size = BP_SIZE * 4  # Ukuran chunk optimal
         
-        if is_valid:
-            print(f"✅ PRIVATE KEY FOUND!")
+        while current <= b and found_key is None:
+            search_count += 1
+            
+            # Hitung end untuk chunk ini
+            chunk_end = min(current + chunk_size - 1, b)
+            if chunk_end < current:
+                break
+            
+            chunk_keys = chunk_end - current + 1
+            
+            print(f"\n[Search #{search_count}]")
+            print(f"    Range: {hex(current)} - {hex(chunk_end)}")
+            print(f"    Chunk size: {chunk_keys:,} keys")
+            print(f"    Progress: {((current - a) / total_keys * 100):.2f}%")
+            
+            # Pencarian dengan GPU
+            result, elapsed = gpu_search_range(bsgsgpu, P3, current, chunk_end)
+            
+            if result is None:
+                print("[-] GPU search failed, stopping...")
+                break
+            
+            if result and result.strip():
+                print(f"[!] GPU returned potential key: {result}")
+                
+                # Verifikasi key
+                if verify_key(result, PUBLIC_KEY):
+                    found_key = int(result, 16)
+                    print(f"\n✅ KEY FOUND AND VERIFIED!")
+                    print(f"   Private Key: {hex(found_key)}")
+                    break
+                else:
+                    print("[-] False positive, continuing...")
+            
+            # Update statistics
+            keys_searched += chunk_keys
+            
+            if elapsed > 0:
+                speed = chunk_keys / elapsed
+                total_time = time.time() - start_total_time
+                avg_speed = keys_searched / total_time if total_time > 0 else 0
+                
+                print(f"[Stats] This search: {speed:,.0f} keys/sec")
+                print(f"[Stats] Average: {avg_speed:,.0f} keys/sec")
+                
+                # Estimasi waktu tersisa
+                if avg_speed > 0:
+                    remaining = total_keys - keys_searched
+                    eta = remaining / avg_speed
+                    print(f"[Stats] ETA: {eta:.1f} seconds")
+            
+            # Pindah ke chunk berikutnya
+            current = chunk_end + 1
+            
+            # Checkpoint setiap 5 pencarian
+            if search_count % 5 == 0:
+                print(f"\n[Checkpoint] Searches: {search_count}, Keys checked: {keys_searched:,}")
+    
+    except KeyboardInterrupt:
+        print("\n\n[!] Search interrupted by user")
+    except Exception as e:
+        print(f"\n[-] Error during search: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Tampilkan hasil
+        total_time = time.time() - start_total_time
+        
+        print('\n' + '='*70)
+        print('SEARCH COMPLETE')
+        print('='*70)
+        
+        if found_key is not None:
+            print(f"✅ SUCCESS: Private key found!")
             print(f"   Private Key: {hex(found_key)}")
-            print(f"   Private Key (decimal): {found_key}")
-            print(f"   WIF Format: To be calculated")
+            print(f"   Search Time: {total_time:.2f} seconds")
+            print(f"   Keys Checked: {keys_searched:,}")
             
             # Save to file
             with open(OUTPUT_FILE, "w") as f:
@@ -463,90 +370,140 @@ def main():
                 f.write(f"Private Key (hex): {hex(found_key)}\n")
                 f.write(f"Private Key (decimal): {found_key}\n")
                 f.write(f"Search Range: {hex(a)} - {hex(b)}\n")
-                f.write(f"Keys Checked: {keys_checked:,}\n")
-                f.write(f"Search Time: {search_time:.2f} seconds\n")
-                f.write(f"Speed: {keys_checked/search_time:,.0f} keys/sec\n")
+                f.write(f"Keys Checked: {keys_searched:,}\n")
+                f.write(f"Search Time: {total_time:.2f} seconds\n")
+                f.write(f"Speed: {keys_searched/total_time:,.0f} keys/sec\n")
             
             print(f"\n[+] Results saved to {OUTPUT_FILE}")
             
-            # Calculate Bitcoin address
+            # Generate Bitcoin addresses
             try:
-                # Compressed address
                 from bit import Key
                 key_obj = Key.from_int(found_key)
                 print(f"\n[+] Bitcoin Addresses:")
                 print(f"   Compressed: {key_obj.address}")
-                print(f"   Uncompressed: {key_obj._pk.address(uncompressed=True)}")
                 print(f"   SegWit (Bech32): {key_obj.segwit_address}")
                 
-                # Add addresses to file
                 with open(OUTPUT_FILE, "a") as f:
                     f.write(f"\nBitcoin Addresses:\n")
                     f.write(f"Compressed: {key_obj.address}\n")
-                    f.write(f"Uncompressed: {key_obj._pk.address(uncompressed=True)}\n")
                     f.write(f"SegWit: {key_obj.segwit_address}\n")
                     
             except Exception as e:
                 print(f"[!] Could not generate addresses: {e}")
+                
         else:
-            print("❌ Found key but verification FAILED!")
-            print(f"   Key: {hex(found_key)}")
-            print(f"   This should not happen. Please report this issue.")
-    else:
-        print("❌ KEY NOT FOUND in specified range")
-        print(f"   Search Range: {hex(a)} - {hex(b)}")
-        print(f"   Keys Checked: {keys_checked:,}")
-        print(f"   Search Time: {search_time:.2f} seconds")
-        
-        if search_time > 0:
-            speed = keys_checked / search_time
-            print(f"   Average Speed: {speed:,.0f} keys/sec")
+            print(f"❌ Key not found in specified range")
+            print(f"   Search Range: {hex(a)} - {hex(b)}")
+            print(f"   Keys Checked: {keys_searched:,}")
+            print(f"   Search Time: {total_time:.2f} seconds")
             
-            # If we didn't check all keys, show progress
-            if keys_checked < total_keys:
-                progress = (keys_checked / total_keys) * 100
+            if total_time > 0:
+                print(f"   Average Speed: {keys_searched/total_time:,.0f} keys/sec")
+            
+            if keys_searched < total_keys:
+                progress = (keys_searched / total_keys) * 100
                 print(f"   Progress: {progress:.2f}%")
-                remaining = total_keys - keys_checked
-                eta = remaining / speed if speed > 0 else 0
-                print(f"   Estimated Time Remaining: {eta:.2f} seconds")
-    
-    # ==========================================================================
-    # ADDITIONAL DEBUGGING INFO
-    # ==========================================================================
-    
-    print('\n' + '='*70)
-    print('DEBUGGING INFORMATION')
-    print('='*70)
-    
-    # Test a few keys manually
-    print("\n[TEST] Manual verification of random keys in range:")
-    for i in range(3):
-        test_key = random.randint(a, b)
-        test_pub = ice.scalar_multiplication(test_key)
-        test_pub_hex = test_pub.hex()
         
-        # Convert to compressed format for comparison
-        x = int(test_pub[1:33].hex(), 16)
-        y = int(test_pub[33:].hex(), 16)
-        prefix = '02' if y % 2 == 0 else '03'
-        compressed = prefix + format(x, '064x')
-        
-        print(f"  Test {i+1}: Key={hex(test_key)}, Pub={compressed[:20]}...")
+        print('='*70)
+
+# ==============================================================================
+# TROUBLESHOOTING FUNCTION
+# ==============================================================================
+
+def test_gpu_library():
+    """Test fungsi GPU library dengan parameter sederhana"""
+    print("\n" + "="*70)
+    print("GPU LIBRARY DIAGNOSTIC TEST")
+    print("="*70)
     
-    print("\n[+] Program completed.")
+    # Load library
+    bsgsgpu = initialize_gpu_library()
+    if bsgsgpu is None:
+        return False
+    
+    # Coba test dengan parameter minimal
+    print("\n[+] Testing GPU library with minimal parameters...")
+    
+    # Buat data test sederhana
+    test_priv = 0x12345
+    test_pub = ice.scalar_multiplication(test_priv)
+    G = ice.scalar_multiplication(1)
+    
+    # Buat P3 kecil untuk testing
+    test_bp_size = 1000
+    test_P3 = ice.point_loop_addition(test_bp_size, test_pub, G)
+    
+    if test_P3 is None:
+        print("[-] Failed to create test P3 table")
+        return False
+    
+    # Coba panggil dengan range kecil
+    start_key = 0x10000
+    end_key = 0x20000
+    keyspace_str = f"{start_key:x}:{end_key:x}"
+    
+    print(f"[Test] Range: {hex(start_key)} - {hex(end_key)}")
+    print(f"[Test] Keyspace: {keyspace_str}")
+    print(f"[Test] BP Size: {test_bp_size}")
+    
+    try:
+        # Hitung bits
+        gpu_bits = int(math.log2(test_bp_size)) if test_bp_size > 0 else 10
+        
+        # Panggil dengan parameter minimal
+        res = bsgsgpu.bsgsGPU(
+            16,  # threads
+            8,   # blocks
+            64,  # points
+            gpu_bits,
+            0,   # device
+            test_P3,
+            len(test_P3) // 65,
+            keyspace_str.encode('utf8'),
+            str(test_bp_size).encode('utf8')
+        )
+        
+        if res:
+            pvk_ptr = ctypes.cast(res, ctypes.c_char_p)
+            if pvk_ptr.value:
+                result = pvk_ptr.value.decode('utf8').strip()
+                print(f"[Test] GPU returned: {result}")
+            else:
+                print("[Test] GPU returned empty result")
+            bsgsgpu.free_memory(res)
+        else:
+            print("[Test] GPU returned NULL")
+        
+        print("[+] GPU library test completed")
+        return True
+        
+    except Exception as e:
+        print(f"[-] GPU library test failed: {e}")
+        return False
 
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
 
 if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("BITCOIN PRIVATE KEY SEARCH - GPU VERSION")
+    print("="*70)
+    
+    # Jalankan diagnostic test terlebih dahulu
+    if not test_gpu_library():
+        print("\n[!] GPU library diagnostic test failed.")
+        print("[!] Trying to continue anyway...\n")
+    
+    # Jalankan pencarian utama
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n[!] Search interrupted by user")
+        print("\n\n[!] Program interrupted by user")
     except Exception as e:
         print(f"\n[-] Fatal error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print("\n[+] Exiting...")
+        print("\n[+] Program terminated")
