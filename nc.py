@@ -1,462 +1,293 @@
 # -*- coding: utf-8 -*-
 """
-GPU BSGS Search Tool - Complete Solution
+BTC Puzzle Private Key Search
+Target Public Key: 033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c
+Key Range: 80000:fffff (hex)
+Menggunakan algoritma BSGS dengan akselerasi GPU
 """
 
 import secp256k1_lib as ice
+import bit
 import ctypes
 import os
 import sys
 import platform
-import time
 import math
-import signal
+import time
 
 # ==============================================================================
-# KONFIGURASI
+# Konfigurasi Public Key dan Range Target
 # ==============================================================================
+TARGET_PUBKEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"
+KEYSPACE_MIN = 0x80000  # 524288 dalam decimal
+KEYSPACE_MAX = 0xfffff  # 1048575 dalam decimal
 
-# Target public key (contoh)
-PUBLIC_KEY = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"
-
-# Range yang akan dicari (small untuk testing)
-KEYSPACE_MIN = 0x80000      # 524,288
-KEYSPACE_MAX = 0xFFFFF      # 1,048,575
-
-# Konfigurasi GPU
+# Konfigurasi GPU (disesuaikan dengan hardware Anda)
 GPU_DEVICE = 0
-GPU_THREADS = 256
-GPU_BLOCKS = 128
+GPU_THREADS = 64
+GPU_BLOCKS = 10
 GPU_POINTS = 256
-BP_SIZE = 500000
+BP_SIZE = 50000  # Baby-step table size (disesuaikan dengan range)
 
 # ==============================================================================
-# FUNGSI UTILITAS
+# Fungsi Konversi dan Helper
 # ==============================================================================
 
-def pubkey_to_uncompressed(pubkey_hex):
-    """Convert public key to uncompressed format"""
-    if pubkey_hex.startswith('02') or pubkey_hex.startswith('03'):
-        # Compressed format
-        x = int(pubkey_hex[2:], 16)
-        p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-        y_sq = (pow(x, 3, p) + 7) % p
-        y = pow(y_sq, (p + 1) // 4, p)
-        
-        if (pubkey_hex.startswith('02') and y % 2 == 1) or (pubkey_hex.startswith('03') and y % 2 == 0):
-            y = p - y
-        
-        return bytes.fromhex('04' + format(x, '064x') + format(y, '064x'))
+def pubkey_to_uncompressed(pub_hex):
+    """
+    Konversi public key compressed/uncompressed ke format uncompressed 65-byte
+    """
+    if pub_hex.startswith('04'):  # Already uncompressed
+        if len(pub_hex) == 130:  # 2 + 64 + 64
+            return bytes.fromhex(pub_hex)
+    
+    # Compressed format (02/03)
+    x = int(pub_hex[2:66], 16)
+    prefix = int(pub_hex[:2], 16)
+    
+    # Gunakan library bit untuk mendapatkan y dari x
+    y_parity = prefix % 2
+    y = bit.format.x_to_y(x, y_parity)
+    
+    return bytes.fromhex('04' + hex(x)[2:].zfill(64) + hex(y)[2:].zfill(64))
+
+def print_banner():
+    """Menampilkan informasi program"""
+    print("\n" + "="*70)
+    print("BTC PUZZLE PRIVATE KEY SEARCH")
+    print("="*70)
+    print(f"Public Key Target: {TARGET_PUBKEY[:20]}...{TARGET_PUBKEY[-20:]}")
+    print(f"Key Range: {hex(KEYSPACE_MIN)} - {hex(KEYSPACE_MAX)}")
+    print(f"Range Size: {KEYSPACE_MAX - KEYSPACE_MIN + 1:,} keys")
+    print(f"GPU Device: {GPU_DEVICE}")
+    print(f"GPU Threads: {GPU_THREADS}, Blocks: {GPU_BLOCKS}")
+    print(f"Baby-Step Table Size: {BP_SIZE:,}")
+    print("="*70 + "\n")
+
+def load_gpu_library():
+    """Memuat library GPU (bt2.so)"""
+    if platform.system().lower().startswith('win'):
+        dllfile = 'bt2.dll'
+    elif platform.system().lower().startswith('lin'):
+        dllfile = 'bt2.so'
     else:
-        # Already uncompressed or invalid
-        return bytes.fromhex(pubkey_hex)
-
-# ==============================================================================
-# GPU LIBRARY WRAPPER
-# ==============================================================================
-
-class GPUSearcher:
-    def __init__(self):
-        self.bsgsgpu = None
-        self.load_library()
-        
-    def load_library(self):
-        """Load GPU library"""
-        if platform.system().lower().startswith('win'):
-            lib_files = ['bt2.dll', 'bsgs_gpu.dll', 'gpu_bsgs.dll']
-        else:
-            lib_files = ['bt2.so', 'libbsgs.so', 'bsgs_gpu.so', 'libbt2.so']
-        
-        for lib_file in lib_files:
-            if os.path.exists(lib_file):
-                try:
-                    print(f"[+] Loading library: {lib_file}")
-                    self.bsgsgpu = ctypes.CDLL(os.path.realpath(lib_file))
-                    
-                    # Setup function signatures
-                    self.setup_functions()
-                    print(f"[+] Library loaded successfully")
-                    return True
-                except Exception as e:
-                    print(f"[-] Failed to load {lib_file}: {e}")
-        
-        print("[-] No GPU library found")
-        return False
+        print('[-] Unsupported Platform. Only Windows and Linux are supported.')
+        sys.exit(1)
     
-    def setup_functions(self):
-        """Setup function prototypes"""
-        # bsgsGPU function
-        self.bsgsgpu.bsgsGPU.argtypes = [
-            ctypes.c_uint32,  # threads
-            ctypes.c_uint32,  # blocks
-            ctypes.c_uint32,  # points
-            ctypes.c_uint32,  # bits
-            ctypes.c_int,     # device
-            ctypes.c_char_p,  # upubs (P3 table)
-            ctypes.c_uint32,  # size (number of points)
-            ctypes.c_char_p,  # keyspace (start:end)
-            ctypes.c_char_p   # bp_size
-        ]
-        self.bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
-        
-        # Free memory function
-        self.bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
-        
-        # Optional: Check if init function exists
-        try:
-            self.bsgsgpu.init_gpu()
-        except:
-            pass
+    if not os.path.isfile(dllfile):
+        print(f'[-] File {dllfile} not found!')
+        print('Please ensure bt2.so (Linux) or bt2.dll (Windows) is in the current directory.')
+        sys.exit(1)
     
-    def search(self, target_pubkey, start_key, end_key, bp_size=BP_SIZE):
-        """Search for private key using GPU"""
-        print(f"\n[+] Preparing search from {hex(start_key)} to {hex(end_key)}")
-        
-        # Prepare data
-        P = pubkey_to_uncompressed(target_pubkey)
-        G = ice.scalar_multiplication(1)
-        
-        print(f"[+] Generating P3 table with {bp_size} points...")
-        P3 = ice.point_loop_addition(bp_size, P, G)
-        
-        if len(P3) != bp_size * 65:
-            print(f"[-] P3 table size incorrect: {len(P3)} bytes, expected {bp_size * 65}")
-            return None
-        
-        print(f"[+] P3 table ready: {len(P3)} bytes")
-        
-        # Calculate bits for bloom filter
-        gpu_bits = int(math.log2(bp_size)) if bp_size > 0 else 19
-        
-        # Format keyspace
-        keyspace_str = f"{start_key:x}:{end_key:x}"
-        
-        print(f"[+] Starting GPU search...")
-        print(f"    Threads: {GPU_THREADS}, Blocks: {GPU_BLOCKS}, Points: {GPU_POINTS}")
-        print(f"    Keyspace: {keyspace_str}")
-        
-        start_time = time.time()
-        
-        try:
-            # Call GPU function
-            result_ptr = self.bsgsgpu.bsgsGPU(
-                GPU_THREADS,
-                GPU_BLOCKS,
-                GPU_POINTS,
-                gpu_bits,
-                GPU_DEVICE,
-                P3,
-                len(P3) // 65,
-                keyspace_str.encode('utf8'),
-                str(bp_size).encode('utf8')
-            )
-            
-            elapsed = time.time() - start_time
-            keys_searched = end_key - start_key + 1
-            
-            if result_ptr:
-                # Get result string
-                result = ctypes.cast(result_ptr, ctypes.c_char_p).value
-                if result:
-                    private_key_hex = result.decode('utf8').strip()
-                    self.bsgsgpu.free_memory(result_ptr)
-                    
-                    print(f"[+] GPU returned: {private_key_hex}")
-                    print(f"[+] Search time: {elapsed:.2f}s")
-                    print(f"[+] Speed: {keys_searched/elapsed:,.0f} keys/sec")
-                    
-                    # Verify the result
-                    if self.verify_key(private_key_hex, target_pubkey):
-                        return private_key_hex
-                    else:
-                        print("[-] Key verification failed")
-                else:
-                    print("[-] GPU returned empty result")
-                    self.bsgsgpu.free_memory(result_ptr)
-            else:
-                print("[-] GPU returned NULL")
-            
-        except Exception as e:
-            print(f"[-] GPU search error: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        return None
+    pathdll = os.path.realpath(dllfile)
+    bsgsgpu = ctypes.CDLL(pathdll)
     
-    def verify_key(self, private_key_hex, target_pubkey):
-        """Verify that private key produces the target public key"""
-        try:
-            priv_int = int(private_key_hex, 16)
-            computed_pub = ice.scalar_multiplication(priv_int)
-            
-            # Convert both to uncompressed for comparison
-            computed_uncompressed = computed_pub
-            target_uncompressed = pubkey_to_uncompressed(target_pubkey)
-            
-            return computed_uncompressed == target_uncompressed
-        except:
-            return False
-
-# ==============================================================================
-# ALTERNATIVE: SIMPLE GPU TEST
-# ==============================================================================
-
-def simple_gpu_test():
-    """Simple test to verify GPU functionality"""
-    print("\n" + "="*70)
-    print("GPU FUNCTIONALITY TEST")
-    print("="*70)
-    
-    # Create a test keypair
-    test_priv = 0xABCDE  # 703,710 (within our range)
-    test_pub = ice.scalar_multiplication(test_priv)
-    
-    # Convert to compressed format
-    x = int(test_pub[1:33].hex(), 16)
-    y = int(test_pub[33:].hex(), 16)
-    prefix = '02' if y % 2 == 0 else '03'
-    test_pub_compressed = prefix + format(x, '064x')
-    
-    print(f"[+] Test Private Key: {hex(test_priv)}")
-    print(f"[+] Test Public Key: {test_pub_compressed}")
-    
-    # Initialize GPU searcher
-    searcher = GPUSearcher()
-    if not searcher.bsgsgpu:
-        print("[-] Cannot test without GPU library")
-        return False
-    
-    # Test with small range around the test key
-    test_start = test_priv - 1000
-    test_end = test_priv + 1000
-    
-    print(f"\n[+] Testing GPU with known key in range {hex(test_start)}-{hex(test_end)}")
-    
-    found = searcher.search(test_pub_compressed, test_start, test_end, bp_size=10000)
-    
-    if found:
-        print(f"[+] GPU TEST PASSED! Found key: {found}")
-        return True
-    else:
-        print("[-] GPU TEST FAILED")
-        return False
-
-# ==============================================================================
-# HYBRID SEARCH APPROACH
-# ==============================================================================
-
-def hybrid_search(target_pubkey, start_key, end_key):
-    """Hybrid search using multiple strategies"""
-    print("\n" + "="*70)
-    print("HYBRID SEARCH STRATEGY")
-    print("="*70)
-    
-    total_keys = end_key - start_key + 1
-    print(f"[+] Total keys to search: {total_keys:,}")
-    
-    # Strategy 1: Try GPU with default settings
-    print("\n[Strategy 1] GPU BSGS with default settings")
-    searcher = GPUSearcher()
-    
-    if searcher.bsgsgpu:
-        result = searcher.search(target_pubkey, start_key, end_key)
-        if result:
-            return result
-    
-    # Strategy 2: Try GPU with different BP sizes
-    print("\n[Strategy 2] Trying different BP sizes")
-    bp_sizes = [100000, 65536, 32768, 16384]
-    
-    for bp_size in bp_sizes:
-        if searcher.bsgsgpu:
-            print(f"\n[+] Trying BP_SIZE = {bp_size}")
-            result = searcher.search(target_pubkey, start_key, end_key, bp_size)
-            if result:
-                return result
-    
-    # Strategy 3: Divide and conquer with GPU
-    print("\n[Strategy 3] Divide and conquer")
-    chunk_size = 100000
-    current = start_key
-    
-    while current <= end_key:
-        chunk_end = min(current + chunk_size - 1, end_key)
-        
-        print(f"\n[+] Searching chunk: {hex(current)}-{hex(chunk_end)}")
-        
-        if searcher.bsgsgpu:
-            result = searcher.search(target_pubkey, current, chunk_end, bp_size=65536)
-            if result:
-                return result
-        
-        current = chunk_end + 1
-    
-    print("\n[-] All GPU strategies failed")
-    return None
-
-# ==============================================================================
-# MANUAL VERIFICATION AND DEBUGGING
-# ==============================================================================
-
-def manual_verification():
-    """Manual verification of key conversion and calculations"""
-    print("\n" + "="*70)
-    print("MANUAL VERIFICATION")
-    print("="*70)
-    
-    # Test with a known key in range
-    test_keys = [
-        0x80000,  # Start of range
-        0xABCDE,  # Middle of range
-        0xFFFFF,  # End of range
-        0x90000,  # Random point
-        0xF0000,  # Another random point
+    # Setup function signatures
+    bsgsgpu.bsgsGPU.argtypes = [
+        ctypes.c_uint32,  # threads
+        ctypes.c_uint32,  # blocks
+        ctypes.c_uint32,  # points
+        ctypes.c_uint32,  # gpu_bits
+        ctypes.c_int,     # device
+        ctypes.c_char_p,  # upubs
+        ctypes.c_uint32,  # size
+        ctypes.c_char_p,  # keyspace
+        ctypes.c_char_p   # bp
     ]
+    bsgsgpu.bsgsGPU.restype = ctypes.c_void_p
+    bsgsgpu.free_memory.argtypes = [ctypes.c_void_p]
     
-    print("[+] Testing public key generation for various private keys:")
-    for priv in test_keys:
-        pub = ice.scalar_multiplication(priv)
-        
-        # Convert to compressed
-        x = int(pub[1:33].hex(), 16)
-        y = int(pub[33:].hex(), 16)
-        prefix = '02' if y % 2 == 0 else '03'
-        compressed = prefix + format(x, '064x')
-        
-        print(f"  Private: {hex(priv)} -> Public: {compressed[:20]}...")
-    
-    # Convert target public key
-    target_uncompressed = pubkey_to_uncompressed(PUBLIC_KEY)
-    print(f"\n[+] Target public key (uncompressed): {target_uncompressed.hex()[:20]}...")
-    
-    # Check if target is valid point
-    if len(target_uncompressed) == 65 and target_uncompressed[0] == 4:
-        print("[+] Target public key format: VALID")
-    else:
-        print("[-] Target public key format: INVALID")
+    return bsgsgpu
 
-# ==============================================================================
-# MAIN PROGRAM
-# ==============================================================================
+def search_range(bsgsgpu, P3, start_key, end_key, bp_size, attempt_num):
+    """Melakukan pencarian dalam satu range menggunakan GPU"""
+    # Konversi keyspace ke string hex
+    st_en = hex(start_key)[2:] + ':' + hex(end_key)[2:]
+    
+    print(f"\n[+] Attempt {attempt_num}")
+    print(f"[+] Searching range: {hex(start_key)} - {hex(end_key)}")
+    print(f"[+] Range size: {end_key - start_key + 1:,} keys")
+    
+    # Hitung gpu_bits dari bp_size
+    gpu_bits = int(math.log2(bp_size))
+    
+    # Waktu mulai
+    start_time = time.time()
+    
+    # Panggil fungsi BSGS GPU
+    res_ptr = bsgsgpu.bsgsGPU(
+        GPU_THREADS,
+        GPU_BLOCKS,
+        GPU_POINTS,
+        gpu_bits,
+        GPU_DEVICE,
+        P3,
+        len(P3) // 65,
+        st_en.encode('utf8'),
+        str(bp_size).encode('utf8')
+    )
+    
+    # Ekstrak hasil
+    pvk_hex = (ctypes.cast(res_ptr, ctypes.c_char_p).value).decode('utf8')
+    
+    # Waktu selesai
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    # Bebaskan memori
+    bsgsgpu.free_memory(res_ptr)
+    
+    # Hitung kecepatan (keys per second)
+    keys_searched = end_key - start_key + 1
+    if elapsed_time > 0:
+        keys_per_sec = keys_searched / elapsed_time
+        print(f"[+] Speed: {keys_per_sec:,.2f} keys/second")
+        print(f"[+] Time elapsed: {elapsed_time:.2f} seconds")
+    
+    return pvk_hex
+
+def verify_and_save_key(pvk_hex, P3, output_file="found_key.txt"):
+    """Verifikasi private key dan simpan ke file"""
+    if not pvk_hex:
+        return False
+    
+    print(f"\n[+] Potential key found: {pvk_hex}")
+    
+    try:
+        # Buat public key dari private key untuk verifikasi
+        pvk_int = int(pvk_hex, 16)
+        found_pubkey = bit.Key.from_int(pvk_int).public_key
+        
+        # Cari dalam P3 untuk mendapatkan offset yang benar
+        # P3 adalah array dari P + i*G untuk i=0..bp_size-1
+        pubkey_bytes = bytes.fromhex(found_pubkey)
+        
+        # Cari index dalam P3 (format: array of 65-byte uncompressed pubkeys)
+        # Kita perlu mencari public key yang sesuai
+        idx = -1
+        for i in range(0, len(P3), 65):
+            if P3[i:i+65] == pubkey_bytes:
+                idx = i // 65
+                break
+        
+        if idx >= 0:
+            # Hitung private key yang sebenarnya
+            # BSGS_Key = found_key - idx
+            BSGS_Key = pvk_int - idx
+            
+            # Verifikasi ulang
+            verify_pubkey = bit.Key.from_int(BSGS_Key).public_key
+            if verify_pubkey == found_pubkey:
+                print("\n" + "="*60)
+                print("SUCCESS! PRIVATE KEY FOUND!")
+                print("="*60)
+                print(f"Private Key (hex): {hex(BSGS_Key)}")
+                print(f"Private Key (decimal): {BSGS_Key}")
+                print(f"Public Key: {TARGET_PUBKEY}")
+                print("="*60)
+                
+                # Simpan ke file
+                with open(output_file, "w") as f:
+                    f.write("="*60 + "\n")
+                    f.write("BTC PUZZLE SOLUTION\n")
+                    f.write("="*60 + "\n")
+                    f.write(f"Target Public Key: {TARGET_PUBKEY}\n")
+                    f.write(f"Private Key (hex): {hex(BSGS_Key)}\n")
+                    f.write(f"Private Key (decimal): {BSGS_Key}\n")
+                    f.write(f"Key Range: {hex(KEYSPACE_MIN)} - {hex(KEYSPACE_MAX)}\n")
+                    f.write(f"Found at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("="*60 + "\n")
+                
+                print(f"[+] Result saved to {output_file}")
+                return True
+            else:
+                print("[-] Verification failed!")
+                return False
+        else:
+            print("[-] Key not found in P3 table. False positive?")
+            return False
+            
+    except Exception as e:
+        print(f"[-] Error verifying key: {e}")
+        return False
 
 def main():
-    print("\n" + "="*70)
-    print("BITCOIN PRIVATE KEY SEARCH - GPU OPTIMIZED")
-    print("="*70)
+    """Program utama"""
+    print_banner()
     
-    # Display configuration
-    print(f"[+] Target Public Key: {PUBLIC_KEY}")
-    print(f"[+] Search Range: {hex(KEYSPACE_MIN)} - {hex(KEYSPACE_MAX)}")
-    print(f"[+] Total Keys: {KEYSPACE_MAX - KEYSPACE_MIN + 1:,}")
+    # 1. Load GPU library
+    print("[+] Loading GPU library...")
+    bsgsgpu = load_gpu_library()
+    print("[+] GPU library loaded successfully")
     
-    # First, run manual verification
-    manual_verification()
+    # 2. Konversi public key target ke uncompressed
+    print("[+] Converting target public key...")
+    P = pubkey_to_uncompressed(TARGET_PUBKEY)
+    print(f"[+] Public key converted (65 bytes)")
     
-    # Run GPU test
-    if simple_gpu_test():
-        print("\n[+] GPU is working, proceeding with main search...")
-    else:
-        print("\n[!] GPU test failed, but continuing anyway...")
+    # 3. Dapatkan titik generator G
+    print("[+] Getting generator point G...")
+    G = ice.scalar_multiplication(1)
+    print("[+] Generator point obtained")
     
-    # Run hybrid search
-    print("\n" + "="*70)
-    print("STARTING MAIN SEARCH")
-    print("="*70)
-    
+    # 4. Buat P3 = P + i*G untuk i=0..bp_size-1
+    print(f"[+] Creating baby-step table with {BP_SIZE:,} elements...")
     start_time = time.time()
-    result = hybrid_search(PUBLIC_KEY, KEYSPACE_MIN, KEYSPACE_MAX)
+    P3 = ice.point_loop_addition(BP_SIZE, P, G)
+    table_time = time.time() - start_time
+    print(f"[+] Table created in {table_time:.2f} seconds")
+    print(f"[+] P3 table size: {len(P3)} bytes ({len(P3)//65} points)")
     
-    total_time = time.time() - start_time
+    # 5. Tentukan strategi pencarian
+    # Karena range kecil (0x80000-0xfffff = 524288 keys), kita bisa bagi menjadi beberapa bagian
+    # jika diperlukan untuk monitoring progress
+    total_keys = KEYSPACE_MAX - KEYSPACE_MIN + 1
+    print(f"\n[+] Total keys to search: {total_keys:,}")
     
-    if result:
-        print(f"\n✅ SUCCESS! Private key found: {result}")
-        
-        # Save result
-        with open("found_key.txt", "w") as f:
-            f.write(f"Private Key: {result}\n")
-            f.write(f"Public Key: {PUBLIC_KEY}\n")
-            f.write(f"Search Range: {hex(KEYSPACE_MIN)}-{hex(KEYSPACE_MAX)}\n")
-            f.write(f"Search Time: {total_time:.2f}s\n")
-        
-        print(f"[+] Result saved to found_key.txt")
-        
-        # Generate addresses
-        try:
-            from bit import Key
-            key = Key.from_int(int(result, 16))
-            print(f"\n[+] Bitcoin Addresses:")
-            print(f"   Compressed: {key.address}")
-            print(f"   SegWit: {key.segwit_address}")
-        except:
-            print("[!] Could not generate addresses")
-    else:
-        print(f"\n❌ Key not found in range {hex(KEYSPACE_MIN)}-{hex(KEYSPACE_MAX)}")
-        print(f"   Search Time: {total_time:.2f}s")
-        
-        # Suggest next steps
-        print("\n[+] Suggestions:")
-        print("   1. Verify the public key is correct")
-        print("   2. Verify the private key is actually in the specified range")
-        print("   3. Try a different GPU library")
-        print("   4. Use CPU brute force for this small range")
+    # Kita bisa coba satu range langsung atau bagi menjadi sub-ranges
+    # Untuk range kecil ini, kita bisa coba sekaligus
+    
+    attempt = 1
+    print(f"\n[+] Starting search...")
+    
+    # Lakukan pencarian
+    found_key = search_range(
+        bsgsgpu, 
+        P3, 
+        KEYSPACE_MIN, 
+        KEYSPACE_MAX, 
+        BP_SIZE, 
+        attempt
+    )
+    
+    # Verifikasi jika ditemukan
+    if found_key:
+        success = verify_and_save_key(found_key, P3)
+        if success:
+            return
+    
+    print(f"\n[-] Key not found in the specified range.")
+    print(f"[+] You may want to:")
+    print(f"    1. Double-check the public key")
+    print(f"    2. Verify the key range")
+    print(f"    3. Adjust GPU parameters for better performance")
+    print(f"    4. Try increasing the baby-step table size")
+    
+    # Simpa progress/log
+    with open("search_log.txt", "a") as log:
+        log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - ")
+        log.write(f"Range: {hex(KEYSPACE_MIN)}-{hex(KEYSPACE_MAX)} - ")
+        log.write(f"Not found\n")
 
 # ==============================================================================
-# DIRECT GPU CALL WITH DEBUGGING
+# Jalankan program
 # ==============================================================================
-
-def direct_gpu_debug():
-    """Direct GPU call with maximum debugging"""
-    print("\n" + "="*70)
-    print("DIRECT GPU DEBUGGING")
-    print("="*70)
-    
-    # Load library manually
-    try:
-        bsgsgpu = ctypes.CDLL("./bt2.so")
-        print("[+] Library loaded directly")
-    except Exception as e:
-        print(f"[-] Failed to load library: {e}")
-        return
-    
-    # Try to find function names
-    print("\n[+] Available functions:")
-    for name in dir(bsgsgpu):
-        if not name.startswith('_'):
-            print(f"  - {name}")
-    
-    # Try different function names
-    func_names = ['bsgsGPU', 'bsgs_gpu', 'gpu_bsgs', 'search_key']
-    
-    for func_name in func_names:
-        try:
-            func = getattr(bsgsgpu, func_name)
-            print(f"\n[+] Found function: {func_name}")
-            
-            # Try to call it with minimal parameters
-            print(f"[+] Testing {func_name}...")
-            break
-        except:
-            continue
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
 if __name__ == "__main__":
     try:
-        # First try direct debugging
-        if os.path.exists("bt2.so"):
-            direct_gpu_debug()
-        
-        # Then run main program
         main()
     except KeyboardInterrupt:
-        print("\n\n[!] Search interrupted by user")
+        print("\n\n[-] Search interrupted by user.")
     except Exception as e:
-        print(f"\n[-] Fatal error: {e}")
+        print(f"\n[-] Error: {e}")
         import traceback
         traceback.print_exc()
-    
-    print("\n" + "="*70)
-    print("SEARCH COMPLETE")
-    print("="*70)
