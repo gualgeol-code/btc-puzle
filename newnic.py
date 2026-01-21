@@ -308,30 +308,29 @@ def bsgs_search_batch(start_key, end_key, gpu_device=0):
         'speed': batch_size / elapsed_time if elapsed_time > 0 else 0
     }
 
-def adaptive_batch_size(current_speed, gpu_memory_available=True):
+def adaptive_batch_size(current_speed, current_batch_size):
     """Adjust batch size based on performance"""
-    global BATCH_SIZE
+    # Target: 1-5 seconds per batch
+    target_time = 3.0  # seconds
+    suggested_size = int(current_speed * target_time)
     
-    if current_speed > 0:
-        # Target: 1-5 seconds per batch
-        target_time = 3.0  # seconds
-        suggested_size = int(current_speed * target_time)
-        
-        # Clamp to reasonable bounds
-        suggested_size = max(MIN_BATCH_SIZE, min(suggested_size, MAX_BATCH_SIZE))
-        
-        # Adjust gradually (no more than 20% change)
-        if suggested_size > BATCH_SIZE * 1.2:
-            BATCH_SIZE = int(BATCH_SIZE * 1.2)
-        elif suggested_size < BATCH_SIZE * 0.8:
-            BATCH_SIZE = int(BATCH_SIZE * 0.8)
-        else:
-            BATCH_SIZE = suggested_size
-        
-        if VERBOSE:
-            print(f"[*] Adaptive batch size: {format_large_number(BATCH_SIZE)} keys")
+    # Clamp to reasonable bounds
+    suggested_size = max(MIN_BATCH_SIZE, min(suggested_size, MAX_BATCH_SIZE))
+    
+    # Adjust gradually (no more than 20% change)
+    if suggested_size > current_batch_size * 1.2:
+        new_batch_size = int(current_batch_size * 1.2)
+    elif suggested_size < current_batch_size * 0.8:
+        new_batch_size = int(current_batch_size * 0.8)
+    else:
+        new_batch_size = suggested_size
+    
+    if VERBOSE and new_batch_size != current_batch_size:
+        print(f"[*] Adaptive batch size: {format_large_number(new_batch_size)} keys (from {format_large_number(current_batch_size)})")
+    
+    return new_batch_size
 
-def save_progress(iteration, total_keys, avg_speed, start_time):
+def save_progress(iteration, total_keys, avg_speed, start_time, batch_size):
     """Save search progress to file"""
     try:
         elapsed = time.time() - start_time
@@ -341,18 +340,23 @@ def save_progress(iteration, total_keys, avg_speed, start_time):
             f.write(f"Search Progress - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("="*60 + "\n")
             f.write(f"Public Key: {PUBLIC_KEY}\n")
-            f.write(f"Range: {START_RANGE_HEX} to {END_RANGE_HEX}\n")
+            f.write(f"Range: {START_RANGE_HEX[:30]}... to {END_RANGE_HEX[:30]}...\n")
             f.write(f"Iteration: {iteration}\n")
             f.write(f"Total Keys Checked: {format_large_number(total_keys)}\n")
             f.write(f"Average Speed: {avg_speed:,.0f} keys/sec\n")
             f.write(f"Elapsed Time: {str(timedelta(seconds=int(elapsed)))}\n")
+            f.write(f"Current Batch Size: {format_large_number(batch_size)}\n")
             
             if avg_speed > 0 and keys_remaining > 0:
                 eta_seconds = keys_remaining / avg_speed
                 eta_str = str(timedelta(seconds=int(eta_seconds)))
                 f.write(f"Estimated Time Remaining: {eta_str}\n")
             
-            f.write(f"Current Batch Size: {format_large_number(BATCH_SIZE)}\n")
+            # Calculate probability of finding key
+            if total_keys > 0 and (END_RANGE - START_RANGE + 1) > 0:
+                probability = (total_keys / (END_RANGE - START_RANGE + 1)) * 100
+                f.write(f"Probability Coverage: {probability:.10f}%\n")
+            
             f.write("="*60 + "\n")
         
         if VERBOSE and iteration % 50 == 0:
@@ -362,6 +366,8 @@ def save_progress(iteration, total_keys, avg_speed, start_time):
 
 def bsgs_search_random_optimized(gpu_device=0):
     """Optimized random search for large ranges"""
+    global BATCH_SIZE  # Declare as global to modify it
+    
     print(f"[+] Starting OPTIMIZED random search on GPU {gpu_device}")
     print(f"[+] Initial batch size: {format_large_number(BATCH_SIZE)} keys")
     print(f"[+] Max iterations: {RANDOM_SEARCH_ITERATIONS:,}")
@@ -380,8 +386,10 @@ def bsgs_search_random_optimized(gpu_device=0):
     iteration = 0
     total_keys_checked = 0
     start_time = time.time()
-    last_stats_time = start_time
     speeds = []
+    
+    # Use local variable for current batch size
+    current_batch_size = BATCH_SIZE
     
     print(f"\n{'Iter':>6} {'Batch Size':>15} {'Speed':>15} {'Total Keys':>20} {'Progress':>12}")
     print("-" * 80)
@@ -389,7 +397,7 @@ def bsgs_search_random_optimized(gpu_device=0):
     while iteration < RANDOM_SEARCH_ITERATIONS:
         try:
             # Generate random batch
-            batch_size = BATCH_SIZE
+            batch_size = current_batch_size
             if END_RANGE - START_RANGE < batch_size:
                 batch_size = END_RANGE - START_RANGE
             
@@ -446,7 +454,7 @@ def bsgs_search_random_optimized(gpu_device=0):
             
             # Adaptive batch sizing
             if iteration % 10 == 0 and avg_speed > 0:
-                adaptive_batch_size(avg_speed)
+                current_batch_size = adaptive_batch_size(avg_speed, current_batch_size)
             
             # Print statistics
             if iteration % STATS_INTERVAL == 0 or found_key:
@@ -458,11 +466,13 @@ def bsgs_search_random_optimized(gpu_device=0):
             
             # Save progress periodically
             if iteration % SAVE_PROGRESS_INTERVAL == 0:
-                save_progress(iteration, total_keys_checked, avg_speed, start_time)
+                save_progress(iteration, total_keys_checked, avg_speed, start_time, current_batch_size)
             
             # Return if key found
             if found_key:
-                save_progress(iteration, total_keys_checked, avg_speed, start_time)
+                # Update global BATCH_SIZE with optimized value
+                BATCH_SIZE = current_batch_size
+                save_progress(iteration, total_keys_checked, avg_speed, start_time, current_batch_size)
                 return found_key
             
             # Check for user interrupt without blocking
@@ -470,16 +480,20 @@ def bsgs_search_random_optimized(gpu_device=0):
             
         except KeyboardInterrupt:
             print(f"\n\n[-] Search interrupted at iteration {iteration}")
-            save_progress(iteration, total_keys_checked, avg_speed, start_time)
+            # Update global BATCH_SIZE with optimized value
+            BATCH_SIZE = current_batch_size
+            save_progress(iteration, total_keys_checked, avg_speed, start_time, current_batch_size)
             return None
         except Exception as e:
             print(f"\n[-] Error in iteration {iteration}: {e}")
             # Reduce batch size on error
-            BATCH_SIZE = max(MIN_BATCH_SIZE, BATCH_SIZE // 2)
+            current_batch_size = max(MIN_BATCH_SIZE, current_batch_size // 2)
             time.sleep(1)  # Brief pause before retry
     
     print(f"\n[-] Reached maximum iterations ({RANDOM_SEARCH_ITERATIONS})")
-    save_progress(iteration, total_keys_checked, avg_speed, start_time)
+    # Update global BATCH_SIZE with optimized value
+    BATCH_SIZE = current_batch_size
+    save_progress(iteration, total_keys_checked, avg_speed, start_time, current_batch_size)
     return None
 
 # ==================== MAIN EXECUTION ====================
@@ -588,10 +602,12 @@ def main():
             print("\n[-] Private key not found within the iterations limit")
             print(f"[-] Total keys checked: {format_large_number(total_keys)}")
             print(f"[-] Progress saved to {PROGRESS_FILE}")
+            print(f"[-] Final optimized batch size: {format_large_number(BATCH_SIZE)}")
     
     except KeyboardInterrupt:
         print("\n\n[-] Search interrupted by user")
         print(f"[+] Progress saved to {PROGRESS_FILE}")
+        print(f"[+] Final optimized batch size: {format_large_number(BATCH_SIZE)}")
     except Exception as e:
         print(f"\n[-] Error during search: {e}")
         import traceback
